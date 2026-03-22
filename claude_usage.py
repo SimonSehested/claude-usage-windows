@@ -11,83 +11,56 @@ import threading
 import time
 import queue
 import webbrowser
-import subprocess
 import winreg
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+import keyring
 import tkinter as tk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import pystray
 from pystray import MenuItem as item, Menu
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 APP_NAME         = "ClaudeUsageMonitor"
-REFRESH_INTERVAL = 300   # 5 min
+KEYRING_SERVICE  = "ClaudeUsageMonitor"
+KEYRING_KEY      = "session_key"
+REFRESH_INTERVAL = 300
 
 CREDENTIALS_PATH = os.path.expanduser(
     os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude") + "/.credentials.json"
 )
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
-USAGE_URL   = "https://api.anthropic.com/api/oauth/usage"
-PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-
+# iOS Dark Mode — exact Apple HIG values
 COLORS = {
-    "bg":     "#0f0f1a",
-    "bg2":    "#1a1a2e",
-    "track":  "#2d2d4e",
-    "text":   "#e2e8f0",
-    "muted":  "#64748b",
-    "green":  "#22c55e",
-    "yellow": "#eab308",
-    "red":    "#ef4444",
-    "purple": "#7c3aed",
-    "border": "#334155",
+    "bg":              "#1C1C1E",   # systemBackground
+    "bg2":             "#2C2C2E",   # secondarySystemBackground  (cards)
+    "track":           "#3A3A3C",   # tertiarySystemBackground
+    "text":            "#FFFFFF",
+    "muted":           "#8E8E93",   # secondaryLabel
+    "separator":       "#38383A",
+    "green":           "#30D158",   # systemGreen
+    "yellow":          "#FFD60A",   # systemYellow
+    "red":             "#FF453A",   # systemRed
+    "transparent_key": "#010101",   # window punch-out — never used in design
 }
 
-# ── Credentials ───────────────────────────────────────────────────────────────
-
-def load_token() -> Optional[str]:
-    """Read OAuth access token from Claude Code credentials file."""
-    try:
-        with open(CREDENTIALS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return data["claudeAiOauth"]["accessToken"]
-    except Exception:
-        return None
-
-
-def auth_headers(token: str) -> dict:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
-    }
-
-# ── API ───────────────────────────────────────────────────────────────────────
-
-def fetch_usage() -> dict:
-    token = load_token()
-    if not token:
-        raise FileNotFoundError(
-            "Claude Code credentials not found.\n"
-            "Run  claude  in a terminal and log in first."
-        )
-
-    r = requests.get(USAGE_URL, headers=auth_headers(token), timeout=15)
-    if r.status_code == 401:
-        raise PermissionError("Token expired – run  claude  and log in again.")
-    r.raise_for_status()
-    return r.json()
+# Popup geometry
+POPUP_W      = 320
+SHADOW_BLEED = 18
+RING_SIZE    = 180
+SCALE        = 4          # supersampling factor for PIL rendering
+BAR_W        = 284
+BAR_H        = 10
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def normalise(util) -> float:
-    """Ensure utilization is in 0-1 range regardless of API format."""
-    v = float(util)
-    return v / 100.0 if v > 1.0 else v
+def _hex_to_rgb(h: str):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
 def usage_hex(util: float) -> str:
@@ -97,8 +70,12 @@ def usage_hex(util: float) -> str:
 
 
 def usage_rgb(util: float):
-    c = usage_hex(util).lstrip("#")
-    return tuple(int(c[i:i+2], 16) for i in (0, 2, 4))
+    return _hex_to_rgb(usage_hex(util))
+
+
+def normalise(v) -> float:
+    v = float(v)
+    return v / 100.0 if v > 1.0 else v
 
 
 def fmt_reset(resets_at: Optional[str]) -> str:
@@ -108,159 +85,258 @@ def fmt_reset(resets_at: Optional[str]) -> str:
         dt   = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
         secs = (dt - datetime.now(timezone.utc)).total_seconds()
         if secs <= 0:  return "Resetting soon"
-        d = int(secs // 86400)
-        h = int((secs % 86400) // 3600)
-        m = int((secs % 3600) // 60)
-        if d:    return f"Resets in {d}d {h}h"
-        elif h:  return f"Resets in {h}h {m}m"
-        else:    return f"Resets in {m}m"
+        d, h = int(secs // 86400), int((secs % 86400) // 3600)
+        m    = int((secs % 3600) // 60)
+        if d:   return f"Resets in {d}d {h}h"
+        elif h: return f"Resets in {h}h {m}m"
+        else:   return f"Resets in {m}m"
     except Exception:
         return ""
+
+# ── Credentials & API ─────────────────────────────────────────────────────────
+
+def load_token() -> Optional[str]:
+    try:
+        with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+            return json.load(f)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+
+def fetch_usage() -> dict:
+    token = load_token()
+    if not token:
+        raise FileNotFoundError(
+            "Claude Code credentials not found.\n"
+            "Run  claude  in a terminal and log in first."
+        )
+    r = requests.get(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+        timeout=15,
+    )
+    if r.status_code == 401:
+        raise PermissionError("Token expired – run  claude  in a terminal.")
+    r.raise_for_status()
+    return r.json()
+
+# ── PIL rendering helpers ─────────────────────────────────────────────────────
+
+def _make_popup_bg(w: int, h: int) -> Image.Image:
+    """
+    RGBA image (w+SHADOW_BLEED) × (h+SHADOW_BLEED).
+    Contains a blurred drop shadow + rounded-rect card.
+    """
+    radius        = 22
+    shadow_offset = 6
+    shadow_blur   = 12
+    total_w       = w + SHADOW_BLEED
+    total_h       = h + SHADOW_BLEED
+
+    # Shadow
+    shadow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    sd     = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle(
+        [shadow_offset, shadow_offset, shadow_offset + w, shadow_offset + h],
+        radius=radius, fill=(0, 0, 0, 170),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur // 2))
+
+    # Card
+    img  = Image.alpha_composite(Image.new("RGBA", (total_w, total_h), (0,0,0,0)), shadow)
+    card = ImageDraw.Draw(img)
+    card.rounded_rectangle(
+        [0, 0, w, h],
+        radius=radius,
+        fill=_hex_to_rgb(COLORS["bg"]) + (255,),
+    )
+    return img
+
+
+def _render_ring_image(sd_util: float, fh_util: float) -> Image.Image:
+    """
+    Anti-aliased concentric rings at 4× scale, downsampled with LANCZOS.
+    Outer ring = 7-day weekly, inner ring = 5-hour session.
+    """
+    s      = RING_SIZE * SCALE
+    img    = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw   = ImageDraw.Draw(img)
+
+    rw_out = 22 * SCALE
+    rw_in  = 13 * SCALE
+    gap    =  7 * SCALE
+    p_out  = rw_out // 2 + 2 * SCALE
+    p_in   = p_out + rw_out + gap
+
+    track_rgba = _hex_to_rgb(COLORS["track"]) + (255,)
+
+    def arc_rgba(util):
+        return usage_rgb(util) + (255,)
+
+    # Outer track + arc
+    draw.arc([p_out, p_out, s-p_out, s-p_out],
+             start=0, end=360, fill=track_rgba, width=rw_out)
+    if sd_util > 0:
+        draw.arc([p_out, p_out, s-p_out, s-p_out],
+                 start=-90, end=-90 + 360 * sd_util,
+                 fill=arc_rgba(sd_util), width=rw_out)
+
+    # Inner track + arc
+    draw.arc([p_in, p_in, s-p_in, s-p_in],
+             start=0, end=360, fill=track_rgba, width=rw_in)
+    if fh_util > 0:
+        draw.arc([p_in, p_in, s-p_in, s-p_in],
+                 start=-90, end=-90 + 360 * fh_util,
+                 fill=arc_rgba(fh_util), width=rw_in)
+
+    return img.resize((RING_SIZE, RING_SIZE), Image.LANCZOS)
+
+
+def _render_pill_bar(util: float, color_hex: str) -> Image.Image:
+    """
+    Anti-aliased pill-shaped progress bar, 4× supersampled.
+    Returns BAR_W × BAR_H image.
+    """
+    sw, sh = BAR_W * SCALE, BAR_H * SCALE
+    r      = sh // 2
+    img    = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+    draw   = ImageDraw.Draw(img)
+
+    track_rgba = _hex_to_rgb(COLORS["track"]) + (255,)
+    draw.rounded_rectangle([0, 0, sw-1, sh-1], radius=r, fill=track_rgba)
+
+    if util > 0:
+        fill_w = max(sh, int(sw * util))   # min width = height keeps ends round
+        fill_rgba = _hex_to_rgb(color_hex) + (255,)
+        draw.rounded_rectangle([0, 0, fill_w-1, sh-1], radius=r, fill=fill_rgba)
+
+    return img.resize((BAR_W, BAR_H), Image.LANCZOS)
+
+
+def _make_dot(color_hex: str, size: int = 10) -> Image.Image:
+    """Small anti-aliased circle for legend."""
+    s    = size * SCALE
+    img  = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([0, 0, s-1, s-1], fill=_hex_to_rgb(color_hex) + (255,))
+    return img.resize((size, size), Image.LANCZOS)
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 
 def make_icon(five_hour: Optional[float] = None,
               seven_day: Optional[float] = None) -> Image.Image:
-    """
-    Outer ring = 7-day (weekly, most important)
-    Inner dot  = 5-hour session colour
-    """
+    """64×64 tray icon. Outer arc = weekly, inner dot = 5h. 4× supersampled."""
     size = 64
-    img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    s    = size * SCALE   # 256
+    img  = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     if seven_day is None and five_hour is None:
-        draw.ellipse([4, 4, size-4, size-4], fill=(60, 60, 80, 255))
-        return img
+        draw.ellipse([8*SCALE, 8*SCALE, (size-8)*SCALE, (size-8)*SCALE],
+                     fill=(80, 80, 90, 255))
+        return img.resize((size, size), Image.LANCZOS)
 
-    bg    = (20, 20, 35, 255)
-    track = (50, 50, 75, 255)
-    # Outer arc = weekly
-    sd    = seven_day if seven_day is not None else 0.0
-    arc   = usage_rgb(sd) + (255,)
-    # Inner dot = 5-hour
-    dot   = (usage_rgb(five_hour) if five_hour is not None
-             else (50, 50, 75)) + (255,)
+    sd  = seven_day  if seven_day  is not None else 0.0
+    fh  = five_hour  if five_hour  is not None else 0.0
 
-    pad, rw = 3, 10
-    draw.ellipse([pad, pad, size-pad, size-pad], fill=bg)
-    draw.arc([pad+1, pad+1, size-pad-1, size-pad-1],
+    pad, rw  = 3*SCALE, 10*SCALE
+    bg_color = _hex_to_rgb(COLORS["bg"]) + (255,)
+    track    = _hex_to_rgb(COLORS["track"]) + (255,)
+
+    draw.ellipse([pad, pad, s-pad, s-pad], fill=bg_color)
+    draw.arc([pad+SCALE, pad+SCALE, s-pad-SCALE, s-pad-SCALE],
              start=0, end=360, fill=track, width=rw)
     if sd > 0:
-        draw.arc([pad+1, pad+1, size-pad-1, size-pad-1],
-                 start=-90, end=-90 + int(360 * sd),
-                 fill=arc, width=rw)
-    inner = pad + rw + 4
-    draw.ellipse([inner, inner, size-inner, size-inner], fill=dot)
-    return img
+        draw.arc([pad+SCALE, pad+SCALE, s-pad-SCALE, s-pad-SCALE],
+                 start=-90, end=-90 + int(360*sd),
+                 fill=usage_rgb(sd) + (255,), width=rw)
+
+    inner = pad + rw + 4*SCALE
+    dot_color = usage_rgb(fh) + (255,) if fh > 0 else track
+    draw.ellipse([inner, inner, s-inner, s-inner], fill=dot_color)
+
+    return img.resize((size, size), Image.LANCZOS)
 
 # ── Detail popup ──────────────────────────────────────────────────────────────
 
-def _double_ring_section(parent,
-                         sd_util: float, sd_resets: Optional[str],
-                         fh_util: float, fh_resets: Optional[str]):
-    """
-    Double concentric ring:
-      Outer (thick) = 7-day weekly  — most important
-      Inner (thin)  = 5-hour session
-    """
-    size    = 150
-    rw_out  = 14   # outer ring width
-    rw_in   = 8    # inner ring width
-    gap     = 5    # gap between rings
-    pad_out = rw_out // 2 + 2
-    pad_in  = pad_out + rw_out + gap
-
-    sd_color = usage_hex(sd_util)
-    fh_color = usage_hex(fh_util)
-    sd_pct   = int(sd_util * 100)
-    fh_pct   = int(fh_util * 100)
-
+def _double_ring_section(parent, sd_util, sd_resets, fh_util, fh_resets):
     frame = tk.Frame(parent, bg=COLORS["bg"])
-    frame.pack(pady=(4, 2))
+    frame.pack(pady=(2, 4))
 
-    cv = tk.Canvas(frame, width=size, height=size,
+    # Rings (PIL-rendered, displayed on Canvas)
+    ring_img = _render_ring_image(sd_util, fh_util)
+    cv = tk.Canvas(frame, width=RING_SIZE, height=RING_SIZE,
                    bg=COLORS["bg"], highlightthickness=0)
     cv.pack()
+    cv._photo = ImageTk.PhotoImage(ring_img)   # prevent GC
+    cv.create_image(0, 0, image=cv._photo, anchor="nw")
 
-    # ── Outer ring: 7-day ──────────────────────────────────────────────────
-    cv.create_arc(pad_out, pad_out, size-pad_out, size-pad_out,
-                  start=0, extent=359.9,
-                  style="arc", outline=COLORS["track"], width=rw_out)
-    if sd_util > 0:
-        cv.create_arc(pad_out, pad_out, size-pad_out, size-pad_out,
-                      start=90, extent=-(360 * sd_util),
-                      style="arc", outline=sd_color, width=rw_out)
+    # Centre text (ClearType via tkinter, layered over PIL rings)
+    cx = RING_SIZE // 2
+    sd_color = usage_hex(sd_util)
+    cv.create_text(cx, cx - 14,
+                   text=f"{int(sd_util*100)}%",
+                   font=("Segoe UI", 26, "bold"), fill=sd_color)
+    cv.create_text(cx, cx + 14,
+                   text="7-Day",
+                   font=("Segoe UI", 9), fill=COLORS["muted"])
 
-    # ── Inner ring: 5-hour ─────────────────────────────────────────────────
-    cv.create_arc(pad_in, pad_in, size-pad_in, size-pad_in,
-                  start=0, extent=359.9,
-                  style="arc", outline=COLORS["track"], width=rw_in)
-    if fh_util > 0:
-        cv.create_arc(pad_in, pad_in, size-pad_in, size-pad_in,
-                      start=90, extent=-(360 * fh_util),
-                      style="arc", outline=fh_color, width=rw_in)
+    # Legend row
+    legend = tk.Frame(frame, bg=COLORS["bg"])
+    legend.pack(pady=(6, 0))
 
-    # ── Centre text: weekly % (most important) ─────────────────────────────
-    cx = size // 2
-    cv.create_text(cx, cx - 12, text=f"{sd_pct}%",
-                   font=("Segoe UI", 22, "bold"), fill=sd_color)
-    cv.create_text(cx, cx + 12, text="7-Day",
-                   font=("Segoe UI", 8), fill=COLORS["muted"])
+    for color, label in [
+        (sd_color,         f"7d: {int(sd_util*100)}%"),
+        (usage_hex(fh_util), f"5h: {int(fh_util*100)}%"),
+    ]:
+        lf = tk.Frame(legend, bg=COLORS["bg"])
+        lf.pack(side="left", padx=10)
 
-    # ── Labels row under ring ──────────────────────────────────────────────
-    labels = tk.Frame(frame, bg=COLORS["bg"])
-    labels.pack(pady=(4, 0))
+        dot_img = _make_dot(color, 8)
+        dot_lbl = tk.Label(lf, bg=COLORS["bg"])
+        dot_lbl._photo = ImageTk.PhotoImage(dot_img)
+        dot_lbl.configure(image=dot_lbl._photo)
+        dot_lbl.pack(side="left", padx=(0, 4))
 
-    def _dot_label(parent, color, text):
-        f = tk.Frame(parent, bg=COLORS["bg"])
-        f.pack(side="left", padx=8)
-        tk.Canvas(f, width=8, height=8, bg=COLORS["bg"],
-                  highlightthickness=0).pack(side="left", pady=2)
-        # draw dot
-        c = tk.Canvas(f, width=10, height=10,
-                      bg=COLORS["bg"], highlightthickness=0)
-        c.pack(side="left")
-        c.create_oval(1, 1, 9, 9, fill=color, outline="")
-        tk.Label(f, text=text, font=("Segoe UI", 8),
-                 bg=COLORS["bg"], fg=COLORS["muted"]).pack(side="left", padx=2)
+        tk.Label(lf, text=label, font=("Segoe UI", 8),
+                 bg=COLORS["bg"], fg=COLORS["muted"]).pack(side="left")
 
-    _dot_label(labels, sd_color, f"7d: {sd_pct}%")
-    _dot_label(labels, fh_color, f"5h: {fh_pct}%")
-
-    # ── Reset times ────────────────────────────────────────────────────────
-    for rt in [fmt_reset(sd_resets), fmt_reset(fh_resets)]:
-        if rt:
-            tk.Label(frame, text=rt, font=("Segoe UI", 7),
-                     bg=COLORS["bg"], fg=COLORS["muted"]).pack()
+    # Reset times
+    for rt in filter(None, [fmt_reset(sd_resets), fmt_reset(fh_resets)]):
+        tk.Label(frame, text=rt, font=("Segoe UI", 8),
+                 bg=COLORS["bg"], fg=COLORS["muted"]).pack()
 
 
 def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
-    frame = tk.Frame(parent, bg=COLORS["bg"])
-    frame.pack(fill="x", pady=(0, 6))
+    """iOS-style metric card with pill progress bar."""
+    card = tk.Frame(parent, bg=COLORS["bg2"], padx=14, pady=10)
+    card.pack(fill="x", pady=(0, 8))
 
-    pct   = int(util * 100)
     color = usage_hex(util)
+    pct   = int(util * 100)
 
-    row1 = tk.Frame(frame, bg=COLORS["bg"])
-    row1.pack(fill="x")
-    tk.Label(row1, text=label, font=("Segoe UI", 9),
-             bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
-    tk.Label(row1, text=f"{pct}%", font=("Segoe UI", 9, "bold"),
-             bg=COLORS["bg"], fg=color).pack(side="right")
+    row = tk.Frame(card, bg=COLORS["bg2"])
+    row.pack(fill="x", pady=(0, 6))
+    tk.Label(row, text=label, font=("Segoe UI", 10),
+             bg=COLORS["bg2"], fg=COLORS["text"]).pack(side="left")
+    tk.Label(row, text=f"{pct}%", font=("Segoe UI", 10, "bold"),
+             bg=COLORS["bg2"], fg=color).pack(side="right")
 
-    bar_w, bar_h = 268, 8
-    cv = tk.Canvas(frame, width=bar_w, height=bar_h,
-                   bg=COLORS["track"], highlightthickness=0)
-    cv.pack(pady=(3, 1))
-    if util > 0:
-        cv.create_rectangle(0, 0, max(1, int(bar_w * util)), bar_h,
-                             fill=color, outline="")
+    bar_img = _render_pill_bar(util, color)
+    bar_cv  = tk.Canvas(card, width=BAR_W, height=BAR_H,
+                        bg=COLORS["bg2"], highlightthickness=0)
+    bar_cv.pack()
+    bar_cv._photo = ImageTk.PhotoImage(bar_img)
+    bar_cv.create_image(0, 0, image=bar_cv._photo, anchor="nw")
 
     rt = fmt_reset(resets_at)
     if rt:
-        tk.Label(frame, text=rt, font=("Segoe UI", 7),
-                 bg=COLORS["bg"], fg=COLORS["muted"]).pack(anchor="w")
+        tk.Label(card, text=rt, font=("Segoe UI", 8),
+                 bg=COLORS["bg2"], fg=COLORS["muted"]).pack(anchor="w", pady=(4, 0))
 
 
 EXTRA_BAR_KEYS = [
@@ -268,11 +344,18 @@ EXTRA_BAR_KEYS = [
     ("seven_day_opus",   "7-Day Opus"),
 ]
 
+HEADER_H    = 52
+RING_H      = 248   # ring(180) + legend(38) + resets(30)
+BAR_ROW_H   = 72
+SEP_H       = 17
+FOOTER_H    = 26
+ERR_H       = 55
+EMPTY_H     = 35
+CARD_PAD    = 18    # content frame inset from card edge
+
 
 def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
-    sd_data  = None   # (util, resets_at)
-    fh_data  = None
-    bar_rows = []
+    sd_data, fh_data, bar_rows = None, None, []
 
     if usage_data:
         sd_v = usage_data.get("seven_day")
@@ -281,65 +364,97 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
             sd_data = (normalise(sd_v["utilization"]), sd_v.get("resets_at"))
         if fh_v and "utilization" in fh_v:
             fh_data = (normalise(fh_v["utilization"]), fh_v.get("resets_at"))
-        for key, label in EXTRA_BAR_KEYS:
+        for key, lbl in EXTRA_BAR_KEYS:
             v = usage_data.get(key)
             if v and isinstance(v, dict) and "utilization" in v:
-                bar_rows.append((label, normalise(v["utilization"]), v.get("resets_at")))
+                bar_rows.append((lbl, normalise(v["utilization"]), v.get("resets_at")))
 
     has_rings = sd_data or fh_data
-    ring_h    = 220 if has_rings else 0
-    bars_h    = len(bar_rows) * 58
-    err_h     = 50 if last_error else 0
-    empty_h   = 30 if (not has_rings and not bar_rows and not last_error) else 0
-    win_w     = 300
-    win_h     = 52 + ring_h + bars_h + err_h + empty_h + 22
+    content_h = (
+        HEADER_H
+        + (RING_H if has_rings else 0)
+        + (SEP_H  if has_rings and bar_rows else 0)
+        + len(bar_rows) * BAR_ROW_H
+        + (ERR_H   if last_error else 0)
+        + (EMPTY_H if not has_rings and not bar_rows and not last_error else 0)
+        + FOOTER_H
+    )
 
     win = tk.Toplevel(root)
     win.overrideredirect(True)
-    win.configure(bg=COLORS["border"])
+    win.configure(bg=COLORS["transparent_key"])
+    win.wm_attributes("-transparentcolor", COLORS["transparent_key"])
     win.attributes("-topmost", True)
 
+    toplevel_w = POPUP_W + SHADOW_BLEED
+    toplevel_h = content_h + SHADOW_BLEED
+
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    win.geometry(f"{win_w}x{win_h}+{sw-win_w-14}+{sh-win_h-52}")
+    win.geometry(f"{toplevel_w}x{toplevel_h}+{sw-POPUP_W-14}+{sh-content_h-52}")
 
-    inner = tk.Frame(win, bg=COLORS["bg"], padx=14, pady=10)
-    inner.pack(fill="both", expand=True, padx=1, pady=1)
+    # Background canvas (draws rounded card + shadow)
+    bg_cv = tk.Canvas(win, width=toplevel_w, height=toplevel_h,
+                      bg=COLORS["transparent_key"], highlightthickness=0)
+    bg_cv.pack()
+    bg_img = _make_popup_bg(POPUP_W, content_h)
+    bg_cv._photo = ImageTk.PhotoImage(bg_img)
+    bg_cv.create_image(0, 0, image=bg_cv._photo, anchor="nw")
 
-    hdr = tk.Frame(inner, bg=COLORS["bg"])
-    hdr.pack(fill="x", pady=(0, 6))
-    tk.Label(hdr, text="Claude AI Usage", font=("Segoe UI", 11, "bold"),
+    # Content frame placed inside the card (with padding)
+    content = tk.Frame(bg_cv, bg=COLORS["bg"],
+                       width=POPUP_W - CARD_PAD*2)
+    content.pack_propagate(False)
+    bg_cv.create_window(CARD_PAD, CARD_PAD,
+                        window=content, anchor="nw",
+                        width=POPUP_W - CARD_PAD*2)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = tk.Frame(content, bg=COLORS["bg"])
+    hdr.pack(fill="x", pady=(12, 8))
+    tk.Label(hdr, text="Claude AI Usage", font=("Segoe UI", 13, "bold"),
              bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
-    tk.Button(hdr, text="✕", command=win.destroy,
-              font=("Segoe UI", 9), bg=COLORS["bg"], fg=COLORS["muted"],
-              relief="flat", cursor="hand2").pack(side="right")
+    close = tk.Label(hdr, text="✕", font=("Segoe UI", 11),
+                     bg=COLORS["bg"], fg=COLORS["muted"], cursor="hand2")
+    close.pack(side="right")
+    close.bind("<Button-1>", lambda _: win.destroy())
 
+    # ── Body ──────────────────────────────────────────────────────────────────
     if last_error:
-        tk.Label(inner, text=f"⚠  {last_error}",
+        tk.Label(content, text=f"⚠  {last_error}",
                  font=("Segoe UI", 8), bg=COLORS["bg"], fg=COLORS["red"],
-                 wraplength=265, justify="left").pack(anchor="w", pady=(0, 8))
+                 wraplength=POPUP_W - CARD_PAD*2 - 10,
+                 justify="left").pack(anchor="w", pady=(0, 8))
     elif not has_rings and not bar_rows:
-        tk.Label(inner, text="Loading usage data…",
-                 font=("Segoe UI", 9), bg=COLORS["bg"],
-                 fg=COLORS["muted"]).pack(anchor="w")
+        tk.Label(content, text="Loading usage data…",
+                 font=("Segoe UI", 10), bg=COLORS["bg"],
+                 fg=COLORS["muted"]).pack(anchor="w", pady=8)
     else:
         sd_u, sd_r = sd_data if sd_data else (0.0, None)
         fh_u, fh_r = fh_data if fh_data else (0.0, None)
-        _double_ring_section(inner, sd_u, sd_r, fh_u, fh_r)
+        _double_ring_section(content, sd_u, sd_r, fh_u, fh_r)
 
         if bar_rows:
-            tk.Frame(inner, bg=COLORS["border"], height=1).pack(
-                fill="x", pady=(4, 8))
-            for label, util, ra in bar_rows:
-                _bar_row(inner, label, util, ra)
+            tk.Frame(content, bg=COLORS["separator"], height=1).pack(
+                fill="x", pady=(4, 10))
+            for lbl, util, ra in bar_rows:
+                _bar_row(content, lbl, util, ra)
 
+    # ── Footer ────────────────────────────────────────────────────────────────
     if last_updated:
-        tk.Label(inner, text=f"Updated {last_updated.strftime('%H:%M')}",
-                 font=("Segoe UI", 7), bg=COLORS["bg"],
-                 fg=COLORS["muted"]).pack(anchor="e")
+        tk.Label(content, text=f"Updated {last_updated.strftime('%H:%M')}",
+                 font=("Segoe UI", 8), bg=COLORS["bg"],
+                 fg=COLORS["muted"]).pack(anchor="e", pady=(4, 8))
 
-    win.bind("<FocusOut>", lambda _: win.destroy())
-    win.bind("<Escape>",   lambda _: win.destroy())
+    # Focus + close-on-blur
+    def _on_focus_out(event):
+        focused = win.focus_get()
+        if focused is None or not str(focused).startswith(str(win)):
+            win.destroy()
+
+    win.update_idletasks()
     win.focus_force()
+    win.bind("<FocusOut>", _on_focus_out)
+    win.bind("<Escape>",   lambda _: win.destroy())
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -348,11 +463,11 @@ class App:
         self.usage_data:   Optional[dict]     = None
         self.last_error:   Optional[str]      = None
         self.last_updated: Optional[datetime] = None
-        self._lock   = threading.Lock()
-        self._stop   = threading.Event()
-        self._queue  = queue.Queue()
-        self.tray:   Optional[pystray.Icon] = None
-        self.root:   Optional[tk.Tk]        = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._queue = queue.Queue()
+        self.tray:  Optional[pystray.Icon] = None
+        self.root:  Optional[tk.Tk]        = None
 
     def _refresh(self):
         try:
@@ -374,18 +489,14 @@ class App:
     def _push_icon(self):
         with self._lock:
             data = self.usage_data
-
         fh, sd = None, None
         if data:
             fh_v = data.get("five_hour")
             sd_v = data.get("seven_day")
-            if fh_v and "utilization" in fh_v:
-                fh = normalise(fh_v["utilization"])
-            if sd_v and "utilization" in sd_v:
-                sd = normalise(sd_v["utilization"])
-
+            if fh_v and "utilization" in fh_v: fh = normalise(fh_v["utilization"])
+            if sd_v and "utilization" in sd_v: sd = normalise(sd_v["utilization"])
         if self.tray:
-            self.tray.icon  = make_icon(fh, sd)   # outer=7d, inner=5h
+            self.tray.icon  = make_icon(fh, sd)
             self.tray.title = self._tooltip()
 
     def _tooltip(self) -> str:
@@ -394,10 +505,10 @@ class App:
         if err:      return "Claude Usage – Error"
         if not data: return "Claude Usage – Loading…"
         parts = []
-        for key, label, _ in METRIC_KEYS[:2]:
+        for key, label in [("seven_day", "7d"), ("five_hour", "5h")]:
             v = data.get(key)
             if v and "utilization" in v:
-                parts.append(f"{label.split('-')[0].strip()}: {int(normalise(v['utilization'])*100)}%")
+                parts.append(f"{label}: {int(normalise(v['utilization'])*100)}%")
         return ("Claude Usage — " + " | ".join(parts)) if parts else "Claude Usage"
 
     def _enqueue(self, fn):
@@ -405,8 +516,7 @@ class App:
 
     def _drain_queue(self):
         try:
-            while True:
-                self._queue.get_nowait()()
+            while True: self._queue.get_nowait()()
         except queue.Empty:
             pass
         if self.root:
@@ -422,8 +532,6 @@ class App:
 
     def on_web(self, *_):
         webbrowser.open("https://claude.ai")
-
-    # ── Autostart ─────────────────────────────────────────────────────────────
 
     def _autostart_enabled(self) -> bool:
         try:
@@ -441,9 +549,7 @@ class App:
                              r"Software\Microsoft\Windows\CurrentVersion\Run",
                              0, winreg.KEY_SET_VALUE)
         if enable:
-            # Use pythonw.exe so no console window appears
-            pythonw = os.path.join(os.path.dirname(
-                os.sys.executable), "pythonw.exe")
+            pythonw = os.path.join(os.path.dirname(os.sys.executable), "pythonw.exe")
             script  = os.path.abspath(__file__)
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
                               f'"{pythonw}" "{script}"')
@@ -456,29 +562,11 @@ class App:
 
     def on_toggle_autostart(self, *_):
         self._set_autostart(not self._autostart_enabled())
-        # Rebuild menu so checkmark updates
-        self._rebuild_menu()
-
-    def _rebuild_menu(self):
-        checked = self._autostart_enabled()
-        menu = Menu(
-            item("View Usage",                  self.on_view,            default=True),
-            item("Refresh Now",                 self.on_refresh),
-            Menu.SEPARATOR,
-            item("Open Claude.ai",              self.on_web),
-            Menu.SEPARATOR,
-            item("Start with Windows",          self.on_toggle_autostart,
-                 checked=lambda _: self._autostart_enabled()),
-            Menu.SEPARATOR,
-            item("Quit",                        self.on_quit),
-        )
-        if self.tray:
-            self.tray.menu = menu
 
     def on_quit(self, *_):
         self._stop.set()
-        if self.tray:  self.tray.stop()
-        if self.root:  self.root.after(0, self.root.destroy)
+        if self.tray: self.tray.stop()
+        if self.root: self.root.after(0, self.root.destroy)
 
     def run(self):
         self.root = tk.Tk()
@@ -486,7 +574,7 @@ class App:
         self.root.after(150, self._drain_queue)
 
         menu = Menu(
-            item("View Usage",         self.on_view,              default=True),
+            item("View Usage",         self.on_view,            default=True),
             item("Refresh Now",        self.on_refresh),
             Menu.SEPARATOR,
             item("Open Claude.ai",     self.on_web),
