@@ -12,6 +12,7 @@ import time
 import queue
 import webbrowser
 import subprocess
+import winreg
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -120,27 +121,34 @@ def fmt_reset(resets_at: Optional[str]) -> str:
 
 def make_icon(five_hour: Optional[float] = None,
               seven_day: Optional[float] = None) -> Image.Image:
+    """
+    Outer ring = 7-day (weekly, most important)
+    Inner dot  = 5-hour session colour
+    """
     size = 64
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    if five_hour is None:
+    if seven_day is None and five_hour is None:
         draw.ellipse([4, 4, size-4, size-4], fill=(60, 60, 80, 255))
         return img
 
     bg    = (20, 20, 35, 255)
     track = (50, 50, 75, 255)
-    arc   = usage_rgb(five_hour) + (255,)
-    dot   = (usage_rgb(seven_day) if seven_day is not None
+    # Outer arc = weekly
+    sd    = seven_day if seven_day is not None else 0.0
+    arc   = usage_rgb(sd) + (255,)
+    # Inner dot = 5-hour
+    dot   = (usage_rgb(five_hour) if five_hour is not None
              else (50, 50, 75)) + (255,)
 
     pad, rw = 3, 10
     draw.ellipse([pad, pad, size-pad, size-pad], fill=bg)
     draw.arc([pad+1, pad+1, size-pad-1, size-pad-1],
              start=0, end=360, fill=track, width=rw)
-    if five_hour > 0:
+    if sd > 0:
         draw.arc([pad+1, pad+1, size-pad-1, size-pad-1],
-                 start=-90, end=-90 + int(360 * five_hour),
+                 start=-90, end=-90 + int(360 * sd),
                  fill=arc, width=rw)
     inner = pad + rw + 4
     draw.ellipse([inner, inner, size-inner, size-inner], fill=dot)
@@ -148,12 +156,25 @@ def make_icon(five_hour: Optional[float] = None,
 
 # ── Detail popup ──────────────────────────────────────────────────────────────
 
-def _ring_section(parent, util: float, resets_at: Optional[str]):
-    size  = 130
-    rw    = 14
-    pad   = rw // 2 + 2
-    color = usage_hex(util)
-    pct   = int(util * 100)
+def _double_ring_section(parent,
+                         sd_util: float, sd_resets: Optional[str],
+                         fh_util: float, fh_resets: Optional[str]):
+    """
+    Double concentric ring:
+      Outer (thick) = 7-day weekly  — most important
+      Inner (thin)  = 5-hour session
+    """
+    size    = 150
+    rw_out  = 14   # outer ring width
+    rw_in   = 8    # inner ring width
+    gap     = 5    # gap between rings
+    pad_out = rw_out // 2 + 2
+    pad_in  = pad_out + rw_out + gap
+
+    sd_color = usage_hex(sd_util)
+    fh_color = usage_hex(fh_util)
+    sd_pct   = int(sd_util * 100)
+    fh_pct   = int(fh_util * 100)
 
     frame = tk.Frame(parent, bg=COLORS["bg"])
     frame.pack(pady=(4, 2))
@@ -162,24 +183,56 @@ def _ring_section(parent, util: float, resets_at: Optional[str]):
                    bg=COLORS["bg"], highlightthickness=0)
     cv.pack()
 
-    cv.create_arc(pad, pad, size-pad, size-pad,
+    # ── Outer ring: 7-day ──────────────────────────────────────────────────
+    cv.create_arc(pad_out, pad_out, size-pad_out, size-pad_out,
                   start=0, extent=359.9,
-                  style="arc", outline=COLORS["track"], width=rw)
-    if util > 0:
-        cv.create_arc(pad, pad, size-pad, size-pad,
-                      start=90, extent=-(360 * util),
-                      style="arc", outline=color, width=rw)
+                  style="arc", outline=COLORS["track"], width=rw_out)
+    if sd_util > 0:
+        cv.create_arc(pad_out, pad_out, size-pad_out, size-pad_out,
+                      start=90, extent=-(360 * sd_util),
+                      style="arc", outline=sd_color, width=rw_out)
 
+    # ── Inner ring: 5-hour ─────────────────────────────────────────────────
+    cv.create_arc(pad_in, pad_in, size-pad_in, size-pad_in,
+                  start=0, extent=359.9,
+                  style="arc", outline=COLORS["track"], width=rw_in)
+    if fh_util > 0:
+        cv.create_arc(pad_in, pad_in, size-pad_in, size-pad_in,
+                      start=90, extent=-(360 * fh_util),
+                      style="arc", outline=fh_color, width=rw_in)
+
+    # ── Centre text: weekly % (most important) ─────────────────────────────
     cx = size // 2
-    cv.create_text(cx, cx - 10, text=f"{pct}%",
-                   font=("Segoe UI", 20, "bold"), fill=color)
-    cv.create_text(cx, cx + 13, text="5-Hour Session",
+    cv.create_text(cx, cx - 12, text=f"{sd_pct}%",
+                   font=("Segoe UI", 22, "bold"), fill=sd_color)
+    cv.create_text(cx, cx + 12, text="7-Day",
                    font=("Segoe UI", 8), fill=COLORS["muted"])
 
-    rt = fmt_reset(resets_at)
-    if rt:
-        tk.Label(frame, text=rt, font=("Segoe UI", 8),
-                 bg=COLORS["bg"], fg=COLORS["muted"]).pack()
+    # ── Labels row under ring ──────────────────────────────────────────────
+    labels = tk.Frame(frame, bg=COLORS["bg"])
+    labels.pack(pady=(4, 0))
+
+    def _dot_label(parent, color, text):
+        f = tk.Frame(parent, bg=COLORS["bg"])
+        f.pack(side="left", padx=8)
+        tk.Canvas(f, width=8, height=8, bg=COLORS["bg"],
+                  highlightthickness=0).pack(side="left", pady=2)
+        # draw dot
+        c = tk.Canvas(f, width=10, height=10,
+                      bg=COLORS["bg"], highlightthickness=0)
+        c.pack(side="left")
+        c.create_oval(1, 1, 9, 9, fill=color, outline="")
+        tk.Label(f, text=text, font=("Segoe UI", 8),
+                 bg=COLORS["bg"], fg=COLORS["muted"]).pack(side="left", padx=2)
+
+    _dot_label(labels, sd_color, f"7d: {sd_pct}%")
+    _dot_label(labels, fh_color, f"5h: {fh_pct}%")
+
+    # ── Reset times ────────────────────────────────────────────────────────
+    for rt in [fmt_reset(sd_resets), fmt_reset(fh_resets)]:
+        if rt:
+            tk.Label(frame, text=rt, font=("Segoe UI", 7),
+                     bg=COLORS["bg"], fg=COLORS["muted"]).pack()
 
 
 def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
@@ -210,37 +263,36 @@ def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
                  bg=COLORS["bg"], fg=COLORS["muted"]).pack(anchor="w")
 
 
-# Keys in the API response → display label  (snake_case from OAuth API)
-METRIC_KEYS = [
-    ("five_hour",        "5-Hour Session",  "ring"),
-    ("seven_day",        "7-Day Limit",     "bar"),
-    ("seven_day_sonnet", "7-Day Sonnet",    "bar"),
-    ("seven_day_opus",   "7-Day Opus",      "bar"),
+EXTRA_BAR_KEYS = [
+    ("seven_day_sonnet", "7-Day Sonnet"),
+    ("seven_day_opus",   "7-Day Opus"),
 ]
 
 
 def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
+    sd_data  = None   # (util, resets_at)
     fh_data  = None
     bar_rows = []
 
     if usage_data:
-        for key, label, kind in METRIC_KEYS:
+        sd_v = usage_data.get("seven_day")
+        fh_v = usage_data.get("five_hour")
+        if sd_v and "utilization" in sd_v:
+            sd_data = (normalise(sd_v["utilization"]), sd_v.get("resets_at"))
+        if fh_v and "utilization" in fh_v:
+            fh_data = (normalise(fh_v["utilization"]), fh_v.get("resets_at"))
+        for key, label in EXTRA_BAR_KEYS:
             v = usage_data.get(key)
-            if not (v and isinstance(v, dict) and "utilization" in v):
-                continue
-            util = normalise(v["utilization"])
-            ra   = v.get("resets_at")
-            if kind == "ring":
-                fh_data = (util, ra)
-            else:
-                bar_rows.append((label, util, ra))
+            if v and isinstance(v, dict) and "utilization" in v:
+                bar_rows.append((label, normalise(v["utilization"]), v.get("resets_at")))
 
-    ring_h  = 170 if fh_data else 0
-    bars_h  = len(bar_rows) * 58
-    err_h   = 50 if last_error else 0
-    empty_h = 30 if (not fh_data and not bar_rows and not last_error) else 0
-    win_w   = 300
-    win_h   = 52 + ring_h + bars_h + err_h + empty_h + 22
+    has_rings = sd_data or fh_data
+    ring_h    = 220 if has_rings else 0
+    bars_h    = len(bar_rows) * 58
+    err_h     = 50 if last_error else 0
+    empty_h   = 30 if (not has_rings and not bar_rows and not last_error) else 0
+    win_w     = 300
+    win_h     = 52 + ring_h + bars_h + err_h + empty_h + 22
 
     win = tk.Toplevel(root)
     win.overrideredirect(True)
@@ -265,18 +317,20 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
         tk.Label(inner, text=f"⚠  {last_error}",
                  font=("Segoe UI", 8), bg=COLORS["bg"], fg=COLORS["red"],
                  wraplength=265, justify="left").pack(anchor="w", pady=(0, 8))
-    elif not fh_data and not bar_rows:
+    elif not has_rings and not bar_rows:
         tk.Label(inner, text="Loading usage data…",
                  font=("Segoe UI", 9), bg=COLORS["bg"],
                  fg=COLORS["muted"]).pack(anchor="w")
     else:
-        if fh_data:
-            _ring_section(inner, *fh_data)
-        if fh_data and bar_rows:
+        sd_u, sd_r = sd_data if sd_data else (0.0, None)
+        fh_u, fh_r = fh_data if fh_data else (0.0, None)
+        _double_ring_section(inner, sd_u, sd_r, fh_u, fh_r)
+
+        if bar_rows:
             tk.Frame(inner, bg=COLORS["border"], height=1).pack(
                 fill="x", pady=(4, 8))
-        for label, util, ra in bar_rows:
-            _bar_row(inner, label, util, ra)
+            for label, util, ra in bar_rows:
+                _bar_row(inner, label, util, ra)
 
     if last_updated:
         tk.Label(inner, text=f"Updated {last_updated.strftime('%H:%M')}",
@@ -331,7 +385,7 @@ class App:
                 sd = normalise(sd_v["utilization"])
 
         if self.tray:
-            self.tray.icon  = make_icon(fh, sd)
+            self.tray.icon  = make_icon(fh, sd)   # outer=7d, inner=5h
             self.tray.title = self._tooltip()
 
     def _tooltip(self) -> str:
@@ -369,6 +423,58 @@ class App:
     def on_web(self, *_):
         webbrowser.open("https://claude.ai")
 
+    # ── Autostart ─────────────────────────────────────────────────────────────
+
+    def _autostart_enabled(self) -> bool:
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, APP_NAME)
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _set_autostart(self, enable: bool):
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        if enable:
+            # Use pythonw.exe so no console window appears
+            pythonw = os.path.join(os.path.dirname(
+                os.sys.executable), "pythonw.exe")
+            script  = os.path.abspath(__file__)
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
+                              f'"{pythonw}" "{script}"')
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+
+    def on_toggle_autostart(self, *_):
+        self._set_autostart(not self._autostart_enabled())
+        # Rebuild menu so checkmark updates
+        self._rebuild_menu()
+
+    def _rebuild_menu(self):
+        checked = self._autostart_enabled()
+        menu = Menu(
+            item("View Usage",                  self.on_view,            default=True),
+            item("Refresh Now",                 self.on_refresh),
+            Menu.SEPARATOR,
+            item("Open Claude.ai",              self.on_web),
+            Menu.SEPARATOR,
+            item("Start with Windows",          self.on_toggle_autostart,
+                 checked=lambda _: self._autostart_enabled()),
+            Menu.SEPARATOR,
+            item("Quit",                        self.on_quit),
+        )
+        if self.tray:
+            self.tray.menu = menu
+
     def on_quit(self, *_):
         self._stop.set()
         if self.tray:  self.tray.stop()
@@ -380,12 +486,15 @@ class App:
         self.root.after(150, self._drain_queue)
 
         menu = Menu(
-            item("View Usage",     self.on_view,    default=True),
-            item("Refresh Now",    self.on_refresh),
+            item("View Usage",         self.on_view,              default=True),
+            item("Refresh Now",        self.on_refresh),
             Menu.SEPARATOR,
-            item("Open Claude.ai", self.on_web),
+            item("Open Claude.ai",     self.on_web),
             Menu.SEPARATOR,
-            item("Quit",           self.on_quit),
+            item("Start with Windows", self.on_toggle_autostart,
+                 checked=lambda _: self._autostart_enabled()),
+            Menu.SEPARATOR,
+            item("Quit",               self.on_quit),
         )
         self.tray = pystray.Icon(APP_NAME, make_icon(), "Claude Usage", menu)
         threading.Thread(target=self._poll, daemon=True).start()
