@@ -12,13 +12,15 @@ import time
 import queue
 import webbrowser
 import winreg
+import ctypes
+import ctypes.wintypes
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 import keyring
 import tkinter as tk
-from PIL import Image, ImageDraw, ImageFilter, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item, Menu
 
@@ -49,12 +51,11 @@ COLORS = {
 }
 
 # Popup geometry
-POPUP_W      = 320
-SHADOW_BLEED = 18
-RING_SIZE    = 180
-SCALE        = 4          # supersampling factor for PIL rendering
-BAR_W        = 284
-BAR_H        = 10
+POPUP_W   = 320
+RING_SIZE = 180
+SCALE     = 4          # supersampling factor for PIL rendering
+BAR_W     = 284
+BAR_H     = 10
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -126,35 +127,25 @@ def fetch_usage() -> dict:
 
 # ── PIL rendering helpers ─────────────────────────────────────────────────────
 
-def _make_popup_bg(w: int, h: int) -> Image.Image:
-    """
-    RGBA image (w+SHADOW_BLEED) × (h+SHADOW_BLEED).
-    Contains a blurred drop shadow + rounded-rect card.
-    """
-    radius        = 22
-    shadow_offset = 6
-    shadow_blur   = 12
-    total_w       = w + SHADOW_BLEED
-    total_h       = h + SHADOW_BLEED
-
-    # Shadow
-    shadow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-    sd     = ImageDraw.Draw(shadow)
-    sd.rounded_rectangle(
-        [shadow_offset, shadow_offset, shadow_offset + w, shadow_offset + h],
-        radius=radius, fill=(0, 0, 0, 170),
-    )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur // 2))
-
-    # Card
-    img  = Image.alpha_composite(Image.new("RGBA", (total_w, total_h), (0,0,0,0)), shadow)
-    card = ImageDraw.Draw(img)
-    card.rounded_rectangle(
-        [0, 0, w, h],
-        radius=radius,
-        fill=_hex_to_rgb(COLORS["bg"]) + (255,),
-    )
-    return img
+def _apply_dwm_style(hwnd: int):
+    """Apply Windows 11 native rounded corners and drop shadow to a borderless window."""
+    try:
+        # Rounded corners (Windows 11+)
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWCP_ROUND = 2
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(ctypes.c_int(DWMWCP_ROUND)), 4,
+        )
+        # Drop shadow via DWM frame extension
+        class MARGINS(ctypes.Structure):
+            _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
+                        ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
+        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+            hwnd, ctypes.byref(MARGINS(0, 0, 0, 1))
+        )
+    except Exception:
+        pass
 
 
 def _render_ring_image(sd_util: float, fh_util: float) -> Image.Image:
@@ -382,35 +373,23 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
 
     win = tk.Toplevel(root)
     win.overrideredirect(True)
-    win.configure(bg=COLORS["transparent_key"])
-    win.wm_attributes("-transparentcolor", COLORS["transparent_key"])
+    win.configure(bg=COLORS["bg"])
     win.attributes("-topmost", True)
 
-    toplevel_w = POPUP_W + SHADOW_BLEED
-    toplevel_h = content_h + SHADOW_BLEED
-
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    win.geometry(f"{toplevel_w}x{toplevel_h}+{sw-POPUP_W-14}+{sh-content_h-52}")
+    win.geometry(f"{POPUP_W}x{content_h}+{sw-POPUP_W-14}+{sh-content_h-52}")
 
-    # Background canvas (draws rounded card + shadow)
-    bg_cv = tk.Canvas(win, width=toplevel_w, height=toplevel_h,
-                      bg=COLORS["transparent_key"], highlightthickness=0)
-    bg_cv.pack()
-    bg_img = _make_popup_bg(POPUP_W, content_h)
-    bg_cv._photo = ImageTk.PhotoImage(bg_img)
-    bg_cv.create_image(0, 0, image=bg_cv._photo, anchor="nw")
+    # Apply Windows 11 native rounded corners + drop shadow
+    win.update_idletasks()
+    _apply_dwm_style(win.winfo_id())
 
-    # Content frame placed inside the card (with padding)
-    content = tk.Frame(bg_cv, bg=COLORS["bg"],
-                       width=POPUP_W - CARD_PAD*2)
-    content.pack_propagate(False)
-    bg_cv.create_window(CARD_PAD, CARD_PAD,
-                        window=content, anchor="nw",
-                        width=POPUP_W - CARD_PAD*2)
+    # Content frame directly in window (no canvas background needed)
+    content = tk.Frame(win, bg=COLORS["bg"])
+    content.pack(fill="both", expand=True, padx=CARD_PAD, pady=CARD_PAD)
 
     # ── Header ────────────────────────────────────────────────────────────────
     hdr = tk.Frame(content, bg=COLORS["bg"])
-    hdr.pack(fill="x", pady=(12, 8))
+    hdr.pack(fill="x", pady=(0, 8))
     tk.Label(hdr, text="Claude AI Usage", font=("Segoe UI", 13, "bold"),
              bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
     close = tk.Label(hdr, text="✕", font=("Segoe UI", 11),
@@ -453,8 +432,8 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
 
     win.update_idletasks()
     win.focus_force()
-    win.bind("<FocusOut>", _on_focus_out)
-    win.bind("<Escape>",   lambda _: win.destroy())
+    win.after(200, lambda: win.bind("<FocusOut>", _on_focus_out))
+    win.bind("<Escape>", lambda _: win.destroy())
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
