@@ -227,7 +227,49 @@ def open_settings(root: tk.Tk, on_save=None):
 
 # ── Detail popup ──────────────────────────────────────────────────────────────
 
+def _ring_section(parent, util: float, resets_at: Optional[str]):
+    """Large circular ring showing 5-hour session usage."""
+    size  = 130
+    rw    = 14       # ring stroke width
+    pad   = rw // 2 + 2
+    color = usage_hex(util)
+    track = COLORS["track"]
+    pct   = int(util * 100)
+
+    frame = tk.Frame(parent, bg=COLORS["bg"])
+    frame.pack(pady=(4, 2))
+
+    cv = tk.Canvas(frame, width=size, height=size,
+                   bg=COLORS["bg"], highlightthickness=0)
+    cv.pack()
+
+    # Track (full circle)
+    cv.create_arc(pad, pad, size-pad, size-pad,
+                  start=0, extent=359.9,
+                  style="arc", outline=track, width=rw)
+
+    # Progress arc – clockwise from top
+    if util > 0:
+        extent = -(360 * util)
+        cv.create_arc(pad, pad, size-pad, size-pad,
+                      start=90, extent=extent,
+                      style="arc", outline=color, width=rw)
+
+    # Centre text: percentage
+    cx = size // 2
+    cv.create_text(cx, cx - 10, text=f"{pct}%",
+                   font=("Segoe UI", 20, "bold"), fill=color)
+    cv.create_text(cx, cx + 13, text="5-Hour Session",
+                   font=("Segoe UI", 8), fill=COLORS["muted"])
+
+    rt = fmt_reset(resets_at)
+    if rt:
+        tk.Label(frame, text=rt, font=("Segoe UI", 8),
+                 bg=COLORS["bg"], fg=COLORS["muted"]).pack()
+
+
 def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
+    """Horizontal progress bar row for weekly/other metrics."""
     frame = tk.Frame(parent, bg=COLORS["bg"])
     frame.pack(fill="x", pady=(0, 6))
 
@@ -241,12 +283,13 @@ def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
     tk.Label(row1, text=f"{pct}%", font=("Segoe UI", 9, "bold"),
              bg=COLORS["bg"], fg=color).pack(side="right")
 
-    bar_w, bar_h = 268, 7
+    bar_w, bar_h = 268, 8
     cv = tk.Canvas(frame, width=bar_w, height=bar_h,
                    bg=COLORS["track"], highlightthickness=0)
-    cv.pack(pady=(2, 1))
+    cv.pack(pady=(3, 1))
     fill_w = max(1, int(bar_w * util)) if util > 0 else 0
     if fill_w:
+        # Slightly rounded ends via two overlapping shapes
         cv.create_rectangle(0, 0, fill_w, bar_h, fill=color, outline="")
 
     rt = fmt_reset(resets_at)
@@ -256,24 +299,28 @@ def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
 
 
 def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
-    METRIC_KEYS = [
-        ("fiveHour",       "5-Hour Session"),
+    BAR_KEYS = [
         ("sevenDay",       "7-Day Limit"),
         ("sevenDaySonnet", "7-Day Sonnet"),
         ("sevenDayOpus",   "7-Day Opus"),
         ("extraUsage",     "Extra Usage"),
     ]
 
-    metrics = []
+    fh_data  = usage_data.get("fiveHour")  if usage_data else None
+    bar_rows = []
     if usage_data:
-        for key, label in METRIC_KEYS:
+        for key, label in BAR_KEYS:
             v = usage_data.get(key)
             if v and isinstance(v, dict) and "utilization" in v:
-                metrics.append((label, v["utilization"], v.get("resetsAt")))
+                bar_rows.append((label, v["utilization"], v.get("resetsAt")))
 
-    n      = max(len(metrics), 1)
-    win_w  = 300
-    win_h  = 60 + n * 62 + (30 if last_error else 0) + 22
+    # Height: header + ring section + bar rows + footer
+    ring_h  = 170 if fh_data else 0
+    bars_h  = len(bar_rows) * 58
+    err_h   = 40 if last_error else 0
+    empty_h = 30 if (not fh_data and not bar_rows and not last_error) else 0
+    win_w   = 300
+    win_h   = 52 + ring_h + bars_h + err_h + empty_h + 22
 
     win = tk.Toplevel(root)
     win.overrideredirect(True)
@@ -288,7 +335,7 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
 
     # Header
     hdr = tk.Frame(inner, bg=COLORS["bg"])
-    hdr.pack(fill="x", pady=(0, 8))
+    hdr.pack(fill="x", pady=(0, 6))
     tk.Label(hdr, text="Claude AI Usage", font=("Segoe UI", 11, "bold"),
              bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
     tk.Button(hdr, text="✕", command=win.destroy,
@@ -299,12 +346,22 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
         tk.Label(inner, text=f"⚠  {last_error}",
                  font=("Segoe UI", 8), bg=COLORS["bg"], fg=COLORS["red"],
                  wraplength=260, justify="left").pack(anchor="w", pady=(0, 8))
-    elif not metrics:
+    elif not fh_data and not bar_rows:
         tk.Label(inner, text="Loading usage data…",
                  font=("Segoe UI", 9), bg=COLORS["bg"],
                  fg=COLORS["muted"]).pack(anchor="w")
     else:
-        for label, util, resets_at in metrics:
+        # 5-hour ring
+        if fh_data:
+            _ring_section(inner, fh_data["utilization"], fh_data.get("resetsAt"))
+
+        # Divider
+        if fh_data and bar_rows:
+            tk.Frame(inner, bg=COLORS["border"], height=1).pack(
+                fill="x", pady=(4, 8))
+
+        # Weekly bars
+        for label, util, resets_at in bar_rows:
             _bar_row(inner, label, util, resets_at)
 
     if last_updated:
