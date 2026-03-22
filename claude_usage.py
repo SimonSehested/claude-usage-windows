@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
 """
 Claude AI Usage Monitor for Windows
-System tray app that shows your claude.ai subscription usage in real time.
+Reads credentials from Claude Code (~/.claude/.credentials.json)
+No session key or manual setup required.
 """
 
-import sys
+import os
+import json
 import threading
 import time
 import queue
 import webbrowser
+import subprocess
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
-import keyring
 import tkinter as tk
 from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as item, Menu
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
-APP_NAME        = "ClaudeUsageMonitor"
-KEYRING_SERVICE = "ClaudeUsageMonitor"
-KEYRING_KEY     = "session_key"
-REFRESH_INTERVAL = 300   # seconds between auto-refreshes (5 min)
+APP_NAME         = "ClaudeUsageMonitor"
+REFRESH_INTERVAL = 300   # 5 min
+
+CREDENTIALS_PATH = os.path.expanduser(
+    os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude") + "/.credentials.json"
+)
+
+USAGE_URL   = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 
 COLORS = {
     "bg":     "#0f0f1a",
@@ -39,15 +46,53 @@ COLORS = {
     "border": "#334155",
 }
 
+# ── Credentials ───────────────────────────────────────────────────────────────
+
+def load_token() -> Optional[str]:
+    """Read OAuth access token from Claude Code credentials file."""
+    try:
+        with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+
+def auth_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+    }
+
+# ── API ───────────────────────────────────────────────────────────────────────
+
+def fetch_usage() -> dict:
+    token = load_token()
+    if not token:
+        raise FileNotFoundError(
+            "Claude Code credentials not found.\n"
+            "Run  claude  in a terminal and log in first."
+        )
+
+    r = requests.get(USAGE_URL, headers=auth_headers(token), timeout=15)
+    if r.status_code == 401:
+        raise PermissionError("Token expired – run  claude  and log in again.")
+    r.raise_for_status()
+    return r.json()
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def normalise(util) -> float:
+    """Ensure utilization is in 0-1 range regardless of API format."""
+    v = float(util)
+    return v / 100.0 if v > 1.0 else v
+
+
 def usage_hex(util: float) -> str:
-    if util < 0.60:
-        return COLORS["green"]
-    elif util < 0.85:
-        return COLORS["yellow"]
-    else:
-        return COLORS["red"]
+    if util < 0.60:   return COLORS["green"]
+    elif util < 0.85: return COLORS["yellow"]
+    else:             return COLORS["red"]
 
 
 def usage_rgb(util: float):
@@ -59,11 +104,9 @@ def fmt_reset(resets_at: Optional[str]) -> str:
     if not resets_at:
         return ""
     try:
-        dt  = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        secs = (dt - now).total_seconds()
-        if secs <= 0:
-            return "Resetting soon"
+        dt   = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        secs = (dt - datetime.now(timezone.utc)).total_seconds()
+        if secs <= 0:  return "Resetting soon"
         d = int(secs // 86400)
         h = int((secs % 86400) // 3600)
         m = int((secs % 3600) // 60)
@@ -73,59 +116,10 @@ def fmt_reset(resets_at: Optional[str]) -> str:
     except Exception:
         return ""
 
-# ── Claude API ────────────────────────────────────────────────────────────────
-
-def fetch_usage(session_key: str) -> dict:
-    """
-    Fetches usage data from the internal claude.ai API.
-    Returns a dict with keys like fiveHour, sevenDay, sevenDaySonnet, etc.
-    Each value is { utilization: float 0-1, resetsAt: ISO8601 string }
-    """
-    headers = {
-        "accept": "*/*",
-        "content-type": "application/json",
-        "anthropic-client-platform": "web_claude_ai",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-    }
-    cookies = {"sessionKey": session_key}
-
-    r = requests.get(
-        "https://claude.ai/api/organizations",
-        headers=headers, cookies=cookies, timeout=15,
-    )
-    if r.status_code in (401, 403):
-        raise PermissionError("Session key is invalid or expired – please update it in Settings.")
-    r.raise_for_status()
-
-    orgs = r.json()
-    if not orgs:
-        raise ValueError("No organisations found in your Claude account.")
-    org_id = orgs[0]["uuid"]
-
-    r = requests.get(
-        f"https://claude.ai/api/organizations/{org_id}/usage",
-        headers=headers, cookies=cookies, timeout=15,
-    )
-    if r.status_code in (401, 403):
-        raise PermissionError("Session key is invalid or expired – please update it in Settings.")
-    r.raise_for_status()
-    return r.json()
-
-
-# ── Tray icon image ───────────────────────────────────────────────────────────
+# ── Tray icon ─────────────────────────────────────────────────────────────────
 
 def make_icon(five_hour: Optional[float] = None,
               seven_day: Optional[float] = None) -> Image.Image:
-    """
-    64×64 RGBA icon.
-    Outer arc  = 5-hour session utilisation
-    Inner dot  = 7-day utilisation colour
-    Grey       = loading / no data
-    """
     size = 64
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -140,100 +134,25 @@ def make_icon(five_hour: Optional[float] = None,
     dot   = (usage_rgb(seven_day) if seven_day is not None
              else (50, 50, 75)) + (255,)
 
-    pad  = 3
-    rw   = 10   # ring width
-
+    pad, rw = 3, 10
     draw.ellipse([pad, pad, size-pad, size-pad], fill=bg)
     draw.arc([pad+1, pad+1, size-pad-1, size-pad-1],
              start=0, end=360, fill=track, width=rw)
-
     if five_hour > 0:
-        end_a = -90 + int(360 * five_hour)
         draw.arc([pad+1, pad+1, size-pad-1, size-pad-1],
-                 start=-90, end=end_a, fill=arc, width=rw)
-
+                 start=-90, end=-90 + int(360 * five_hour),
+                 fill=arc, width=rw)
     inner = pad + rw + 4
     draw.ellipse([inner, inner, size-inner, size-inner], fill=dot)
     return img
 
-
-# ── Settings window ───────────────────────────────────────────────────────────
-
-def open_settings(root: tk.Tk, on_save=None):
-    win = tk.Toplevel(root)
-    win.title("Claude Usage – Settings")
-    win.geometry("480x230")
-    win.resizable(False, False)
-    win.configure(bg=COLORS["bg2"])
-    win.attributes("-topmost", True)
-
-    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    win.geometry(f"480x230+{(sw-480)//2}+{(sh-230)//2}")
-
-    tk.Label(win, text="Session Key",
-             font=("Segoe UI", 13, "bold"),
-             bg=COLORS["bg2"], fg=COLORS["text"]).pack(anchor="w", padx=18, pady=(16, 2))
-
-    info = (
-        "How to get your session key:\n"
-        "1. Open claude.ai in your browser and make sure you're logged in\n"
-        "2. Press F12  →  Network tab  →  reload the page (F5)\n"
-        "3. Find a request named 'usage'  →  Request Headers  →  Cookie\n"
-        "4. Copy the value after  sessionKey=  (starts with sk-ant-sid01-…)\n"
-        "   OR: Application tab → Cookies → claude.ai → sessionKey"
-    )
-    tk.Label(win, text=info, font=("Segoe UI", 8),
-             bg=COLORS["bg2"], fg=COLORS["muted"],
-             justify="left").pack(anchor="w", padx=18, pady=(0, 8))
-
-    current = keyring.get_password(KEYRING_SERVICE, KEYRING_KEY) or ""
-    var = tk.StringVar(value=current)
-
-    entry = tk.Entry(win, textvariable=var, font=("Consolas", 8),
-                     bg=COLORS["track"], fg=COLORS["text"],
-                     insertbackground=COLORS["text"], relief="flat",
-                     show="•" if current else "")
-    entry.pack(fill="x", padx=18, ipady=7)
-
-    def toggle():
-        entry.configure(show="" if entry.cget("show") == "•" else "•")
-
-    def save():
-        raw = var.get().strip()
-        if not raw:
-            return
-        # Accept full cookie string: strip key name and extra pairs
-        if "sessionKey=" in raw:
-            raw = raw.split("sessionKey=", 1)[1].split(";", 1)[0].strip()
-        raw = raw.strip('"').strip("'")
-        keyring.set_password(KEYRING_SERVICE, KEYRING_KEY, raw)
-        win.destroy()
-        if on_save:
-            on_save()
-
-    bf = tk.Frame(win, bg=COLORS["bg2"])
-    bf.pack(anchor="w", padx=18, pady=(10, 0))
-
-    for label, cmd, bg in [
-        ("Save",        save,        COLORS["purple"]),
-        ("Show/Hide",   toggle,      COLORS["track"]),
-        ("Cancel",      win.destroy, COLORS["track"]),
-    ]:
-        tk.Button(bf, text=label, command=cmd,
-                  bg=bg, fg="white", font=("Segoe UI", 9),
-                  relief="flat", padx=14, pady=5,
-                  cursor="hand2").pack(side="left", padx=(0, 6))
-
-
 # ── Detail popup ──────────────────────────────────────────────────────────────
 
 def _ring_section(parent, util: float, resets_at: Optional[str]):
-    """Large circular ring showing 5-hour session usage."""
     size  = 130
-    rw    = 14       # ring stroke width
+    rw    = 14
     pad   = rw // 2 + 2
     color = usage_hex(util)
-    track = COLORS["track"]
     pct   = int(util * 100)
 
     frame = tk.Frame(parent, bg=COLORS["bg"])
@@ -243,19 +162,14 @@ def _ring_section(parent, util: float, resets_at: Optional[str]):
                    bg=COLORS["bg"], highlightthickness=0)
     cv.pack()
 
-    # Track (full circle)
     cv.create_arc(pad, pad, size-pad, size-pad,
                   start=0, extent=359.9,
-                  style="arc", outline=track, width=rw)
-
-    # Progress arc – clockwise from top
+                  style="arc", outline=COLORS["track"], width=rw)
     if util > 0:
-        extent = -(360 * util)
         cv.create_arc(pad, pad, size-pad, size-pad,
-                      start=90, extent=extent,
+                      start=90, extent=-(360 * util),
                       style="arc", outline=color, width=rw)
 
-    # Centre text: percentage
     cx = size // 2
     cv.create_text(cx, cx - 10, text=f"{pct}%",
                    font=("Segoe UI", 20, "bold"), fill=color)
@@ -269,7 +183,6 @@ def _ring_section(parent, util: float, resets_at: Optional[str]):
 
 
 def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
-    """Horizontal progress bar row for weekly/other metrics."""
     frame = tk.Frame(parent, bg=COLORS["bg"])
     frame.pack(fill="x", pady=(0, 6))
 
@@ -287,10 +200,9 @@ def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
     cv = tk.Canvas(frame, width=bar_w, height=bar_h,
                    bg=COLORS["track"], highlightthickness=0)
     cv.pack(pady=(3, 1))
-    fill_w = max(1, int(bar_w * util)) if util > 0 else 0
-    if fill_w:
-        # Slightly rounded ends via two overlapping shapes
-        cv.create_rectangle(0, 0, fill_w, bar_h, fill=color, outline="")
+    if util > 0:
+        cv.create_rectangle(0, 0, max(1, int(bar_w * util)), bar_h,
+                             fill=color, outline="")
 
     rt = fmt_reset(resets_at)
     if rt:
@@ -298,26 +210,34 @@ def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
                  bg=COLORS["bg"], fg=COLORS["muted"]).pack(anchor="w")
 
 
+# Keys in the API response → display label  (snake_case from OAuth API)
+METRIC_KEYS = [
+    ("five_hour",        "5-Hour Session",  "ring"),
+    ("seven_day",        "7-Day Limit",     "bar"),
+    ("seven_day_sonnet", "7-Day Sonnet",    "bar"),
+    ("seven_day_opus",   "7-Day Opus",      "bar"),
+]
+
+
 def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
-    BAR_KEYS = [
-        ("sevenDay",       "7-Day Limit"),
-        ("sevenDaySonnet", "7-Day Sonnet"),
-        ("sevenDayOpus",   "7-Day Opus"),
-        ("extraUsage",     "Extra Usage"),
-    ]
-
-    fh_data  = usage_data.get("fiveHour")  if usage_data else None
+    fh_data  = None
     bar_rows = []
-    if usage_data:
-        for key, label in BAR_KEYS:
-            v = usage_data.get(key)
-            if v and isinstance(v, dict) and "utilization" in v:
-                bar_rows.append((label, v["utilization"], v.get("resetsAt")))
 
-    # Height: header + ring section + bar rows + footer
+    if usage_data:
+        for key, label, kind in METRIC_KEYS:
+            v = usage_data.get(key)
+            if not (v and isinstance(v, dict) and "utilization" in v):
+                continue
+            util = normalise(v["utilization"])
+            ra   = v.get("resets_at")
+            if kind == "ring":
+                fh_data = (util, ra)
+            else:
+                bar_rows.append((label, util, ra))
+
     ring_h  = 170 if fh_data else 0
     bars_h  = len(bar_rows) * 58
-    err_h   = 40 if last_error else 0
+    err_h   = 50 if last_error else 0
     empty_h = 30 if (not fh_data and not bar_rows and not last_error) else 0
     win_w   = 300
     win_h   = 52 + ring_h + bars_h + err_h + empty_h + 22
@@ -333,36 +253,30 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
     inner = tk.Frame(win, bg=COLORS["bg"], padx=14, pady=10)
     inner.pack(fill="both", expand=True, padx=1, pady=1)
 
-    # Header
     hdr = tk.Frame(inner, bg=COLORS["bg"])
     hdr.pack(fill="x", pady=(0, 6))
     tk.Label(hdr, text="Claude AI Usage", font=("Segoe UI", 11, "bold"),
              bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
     tk.Button(hdr, text="✕", command=win.destroy,
               font=("Segoe UI", 9), bg=COLORS["bg"], fg=COLORS["muted"],
-              relief="flat", cursor="hand2", padx=2, pady=0).pack(side="right")
+              relief="flat", cursor="hand2").pack(side="right")
 
     if last_error:
         tk.Label(inner, text=f"⚠  {last_error}",
                  font=("Segoe UI", 8), bg=COLORS["bg"], fg=COLORS["red"],
-                 wraplength=260, justify="left").pack(anchor="w", pady=(0, 8))
+                 wraplength=265, justify="left").pack(anchor="w", pady=(0, 8))
     elif not fh_data and not bar_rows:
         tk.Label(inner, text="Loading usage data…",
                  font=("Segoe UI", 9), bg=COLORS["bg"],
                  fg=COLORS["muted"]).pack(anchor="w")
     else:
-        # 5-hour ring
         if fh_data:
-            _ring_section(inner, fh_data["utilization"], fh_data.get("resetsAt"))
-
-        # Divider
+            _ring_section(inner, *fh_data)
         if fh_data and bar_rows:
             tk.Frame(inner, bg=COLORS["border"], height=1).pack(
                 fill="x", pady=(4, 8))
-
-        # Weekly bars
-        for label, util, resets_at in bar_rows:
-            _bar_row(inner, label, util, resets_at)
+        for label, util, ra in bar_rows:
+            _bar_row(inner, label, util, ra)
 
     if last_updated:
         tk.Label(inner, text=f"Updated {last_updated.strftime('%H:%M')}",
@@ -373,8 +287,7 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
     win.bind("<Escape>",   lambda _: win.destroy())
     win.focus_force()
 
-
-# ── Application ───────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
 class App:
     def __init__(self):
@@ -387,18 +300,9 @@ class App:
         self.tray:   Optional[pystray.Icon] = None
         self.root:   Optional[tk.Tk]        = None
 
-    # ── data ─────────────────────────────────────────────────────────────────
-
     def _refresh(self):
-        sk = keyring.get_password(KEYRING_SERVICE, KEYRING_KEY)
-        if not sk:
-            with self._lock:
-                self.last_error  = "No session key set – right-click the tray icon → Settings"
-                self.usage_data  = None
-            self._push_icon()
-            return
         try:
-            data = fetch_usage(sk)
+            data = fetch_usage()
             with self._lock:
                 self.usage_data   = data
                 self.last_error   = None
@@ -413,31 +317,34 @@ class App:
         while not self._stop.wait(REFRESH_INTERVAL):
             self._refresh()
 
-    # ── icon ─────────────────────────────────────────────────────────────────
-
     def _push_icon(self):
         with self._lock:
             data = self.usage_data
-        fh = data["fiveHour"]["utilization"] if data and "fiveHour" in data else None
-        sd = data["sevenDay"]["utilization"] if data and "sevenDay" in data else None
-        img = make_icon(fh, sd)
+
+        fh, sd = None, None
+        if data:
+            fh_v = data.get("five_hour")
+            sd_v = data.get("seven_day")
+            if fh_v and "utilization" in fh_v:
+                fh = normalise(fh_v["utilization"])
+            if sd_v and "utilization" in sd_v:
+                sd = normalise(sd_v["utilization"])
+
         if self.tray:
-            self.tray.icon  = img
+            self.tray.icon  = make_icon(fh, sd)
             self.tray.title = self._tooltip()
 
     def _tooltip(self) -> str:
         with self._lock:
             data, err = self.usage_data, self.last_error
-        if err:   return "Claude Usage – Error"
+        if err:      return "Claude Usage – Error"
         if not data: return "Claude Usage – Loading…"
         parts = []
-        if "fiveHour" in data:
-            parts.append(f"5h: {int(data['fiveHour']['utilization']*100)}%")
-        if "sevenDay" in data:
-            parts.append(f"7d: {int(data['sevenDay']['utilization']*100)}%")
+        for key, label, _ in METRIC_KEYS[:2]:
+            v = data.get(key)
+            if v and "utilization" in v:
+                parts.append(f"{label.split('-')[0].strip()}: {int(normalise(v['utilization'])*100)}%")
         return ("Claude Usage — " + " | ".join(parts)) if parts else "Claude Usage"
-
-    # ── GUI queue (all tk calls must happen on the main thread) ──────────────
 
     def _enqueue(self, fn):
         self._queue.put(fn)
@@ -451,8 +358,6 @@ class App:
         if self.root:
             self.root.after(150, self._drain_queue)
 
-    # ── tray callbacks ───────────────────────────────────────────────────────
-
     def on_view(self, *_):
         with self._lock:
             d, e, u = self.usage_data, self.last_error, self.last_updated
@@ -461,23 +366,13 @@ class App:
     def on_refresh(self, *_):
         threading.Thread(target=self._refresh, daemon=True).start()
 
-    def on_settings(self, *_):
-        self._enqueue(lambda: open_settings(
-            self.root,
-            on_save=lambda: threading.Thread(target=self._refresh, daemon=True).start(),
-        ))
-
     def on_web(self, *_):
         webbrowser.open("https://claude.ai")
 
     def on_quit(self, *_):
         self._stop.set()
-        if self.tray:
-            self.tray.stop()
-        if self.root:
-            self.root.after(0, self.root.destroy)
-
-    # ── run ──────────────────────────────────────────────────────────────────
+        if self.tray:  self.tray.stop()
+        if self.root:  self.root.after(0, self.root.destroy)
 
     def run(self):
         self.root = tk.Tk()
@@ -485,29 +380,15 @@ class App:
         self.root.after(150, self._drain_queue)
 
         menu = Menu(
-            item("View Usage",       self.on_view,     default=True),
-            item("Refresh Now",      self.on_refresh),
+            item("View Usage",     self.on_view,    default=True),
+            item("Refresh Now",    self.on_refresh),
             Menu.SEPARATOR,
-            item("Settings…",        self.on_settings),
-            item("Open Claude.ai",   self.on_web),
+            item("Open Claude.ai", self.on_web),
             Menu.SEPARATOR,
-            item("Quit",             self.on_quit),
+            item("Quit",           self.on_quit),
         )
         self.tray = pystray.Icon(APP_NAME, make_icon(), "Claude Usage", menu)
-
         threading.Thread(target=self._poll, daemon=True).start()
-
-        # Open settings automatically on first run (no session key yet)
-        if not keyring.get_password(KEYRING_SERVICE, KEYRING_KEY):
-            def _delayed_settings():
-                time.sleep(1.5)
-                self._enqueue(lambda: open_settings(
-                    self.root,
-                    on_save=lambda: threading.Thread(
-                        target=self._refresh, daemon=True).start(),
-                ))
-            threading.Thread(target=_delayed_settings, daemon=True).start()
-
         self.tray.run_detached()
         self.root.mainloop()
 
