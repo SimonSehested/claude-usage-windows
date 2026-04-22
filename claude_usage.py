@@ -36,26 +36,27 @@ CREDENTIALS_PATH = os.path.expanduser(
 )
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
-# iOS Dark Mode — exact Apple HIG values
+# Liquid Glass — Apple iOS 26 Light Mode palette
 COLORS = {
-    "bg":              "#1C1C1E",   # systemBackground
-    "bg2":             "#2C2C2E",   # secondarySystemBackground  (cards)
-    "track":           "#3A3A3C",   # tertiarySystemBackground
-    "text":            "#FFFFFF",
-    "muted":           "#8E8E93",   # secondaryLabel
-    "separator":       "#38383A",
-    "green":           "#30D158",   # systemGreen
-    "yellow":          "#FFD60A",   # systemYellow
-    "red":             "#FF453A",   # systemRed
-    "transparent_key": "#010101",   # window punch-out — never used in design
+    "bg":         "#F2F2F7",   # iOS systemGroupedBackground
+    "bg2":        "#FFFFFF",   # card / secondarySystemGroupedBackground
+    "track":      "#E5E5EA",   # ring & bar track (light gray)
+    "text":       "#1C1C1E",   # primary label (dark)
+    "muted":      "#8E8E93",   # secondaryLabel
+    "separator":  "#C6C6C8",   # iOS separator
+    "green":      "#34C759",   # iOS systemGreen (light mode)
+    "yellow":     "#FF9F0A",   # iOS systemOrange-Amber (more legible on light bg)
+    "red":        "#FF3B30",   # iOS systemRed
+    "glass_edge": "#D8D8DC",   # 1-px glass border
 }
 
 # Popup geometry
-POPUP_W   = 320
-RING_SIZE = 180
-SCALE     = 4          # supersampling factor for PIL rendering
-BAR_W     = 284
-BAR_H     = 10
+POPUP_W     = 320
+RING_SIZE   = 180
+SCALE       = 4          # supersampling factor for PIL rendering
+BAR_W       = 284
+BAR_H       = 10
+GLASS_ALPHA = 0.90       # target window opacity for frosted glass feel
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -125,91 +126,124 @@ def fetch_usage() -> dict:
     r.raise_for_status()
     return r.json()
 
-# ── PIL rendering helpers ─────────────────────────────────────────────────────
+# ── DWM + Liquid Glass effects ────────────────────────────────────────────────
 
 def _apply_dwm_style(hwnd: int):
-    """Apply Windows 11 native rounded corners and drop shadow to a borderless window."""
+    """Windows 11 rounded corners, drop shadow, and acrylic blur-behind."""
+    # Rounded corners + drop shadow
     try:
-        # Rounded corners (Windows 11+)
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWCP_ROUND = 2
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-            ctypes.byref(ctypes.c_int(DWMWCP_ROUND)), 4,
-        )
-        # Drop shadow via DWM frame extension
+            hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)  # DWMWCP_ROUND = 2
+
         class MARGINS(ctypes.Structure):
-            _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
-                        ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
+            _fields_ = [("cxLeftWidth",  ctypes.c_int), ("cxRightWidth",  ctypes.c_int),
+                        ("cyTopHeight",  ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
         ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
-            hwnd, ctypes.byref(MARGINS(0, 0, 0, 1))
-        )
+            hwnd, ctypes.byref(MARGINS(0, 0, 0, 1)))
     except Exception:
         pass
 
+    # Acrylic blur-behind with a very light neutral tint (Windows 10 1703+)
+    try:
+        class _AccentPolicy(ctypes.Structure):
+            _fields_ = [("AccentState",   ctypes.c_int),
+                        ("AccentFlags",   ctypes.c_int),
+                        ("GradientColor", ctypes.c_int),   # AABBGGRR
+                        ("AnimationId",   ctypes.c_int)]
+
+        class _WinComposAttr(ctypes.Structure):
+            _fields_ = [("Attribute",  ctypes.c_int),
+                        ("Data",       ctypes.c_void_p),
+                        ("SizeOfData", ctypes.c_size_t)]
+
+        accent = _AccentPolicy()
+        accent.AccentState   = 4            # ACCENT_ENABLE_ACRYLICBLURBEHIND
+        accent.GradientColor = 0x20F7F2F2   # alpha=0x20 (~12%), warm white tint
+
+        data = _WinComposAttr()
+        data.Attribute  = 19                # WCA_ACCENT_POLICY
+        data.SizeOfData = ctypes.sizeof(accent)
+        data.Data       = ctypes.addressof(accent)
+
+        ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+    except Exception:
+        pass
+
+
+def _fade_in(win: tk.Toplevel, target: float = GLASS_ALPHA,
+             steps: int = 14, delay_ms: int = 11):
+    """Smooth fade-in from transparent to target alpha."""
+    step = target / steps
+
+    def _tick(a: float):
+        a = min(a + step, target)
+        try:
+            win.attributes("-alpha", a)
+        except tk.TclError:
+            return
+        if a < target:
+            win.after(delay_ms, lambda: _tick(a))
+
+    win.attributes("-alpha", 0.0)
+    win.after(8, lambda: _tick(0.0))
+
+# ── PIL rendering helpers ─────────────────────────────────────────────────────
 
 def _render_ring_image(sd_util: float, fh_util: float) -> Image.Image:
     """
     Anti-aliased concentric rings at 4× scale, downsampled with LANCZOS.
     Outer ring = 7-day weekly, inner ring = 5-hour session.
+    Thinner rings for a refined Liquid Glass look.
     """
-    s      = RING_SIZE * SCALE
-    img    = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    draw   = ImageDraw.Draw(img)
+    s    = RING_SIZE * SCALE
+    img  = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
 
-    rw_out = 22 * SCALE
-    rw_in  = 13 * SCALE
-    gap    =  7 * SCALE
+    rw_out = 18 * SCALE   # slightly thinner than before
+    rw_in  = 11 * SCALE
+    gap    =  8 * SCALE
     p_out  = rw_out // 2 + 2 * SCALE
     p_in   = p_out + rw_out + gap
 
-    track_rgba = _hex_to_rgb(COLORS["track"]) + (255,)
+    track = _hex_to_rgb(COLORS["track"]) + (255,)
 
-    def arc_rgba(util):
-        return usage_rgb(util) + (255,)
-
-    # Outer track + arc
+    # Outer (7-day) track + arc
     draw.arc([p_out, p_out, s-p_out, s-p_out],
-             start=0, end=360, fill=track_rgba, width=rw_out)
+             start=0, end=360, fill=track, width=rw_out)
     if sd_util > 0:
         draw.arc([p_out, p_out, s-p_out, s-p_out],
                  start=-90, end=-90 + 360 * sd_util,
-                 fill=arc_rgba(sd_util), width=rw_out)
+                 fill=usage_rgb(sd_util) + (255,), width=rw_out)
 
-    # Inner track + arc
+    # Inner (5-hour) track + arc
     draw.arc([p_in, p_in, s-p_in, s-p_in],
-             start=0, end=360, fill=track_rgba, width=rw_in)
+             start=0, end=360, fill=track, width=rw_in)
     if fh_util > 0:
         draw.arc([p_in, p_in, s-p_in, s-p_in],
                  start=-90, end=-90 + 360 * fh_util,
-                 fill=arc_rgba(fh_util), width=rw_in)
+                 fill=usage_rgb(fh_util) + (255,), width=rw_in)
 
     return img.resize((RING_SIZE, RING_SIZE), Image.LANCZOS)
 
 
 def _render_pill_bar(util: float, color_hex: str) -> Image.Image:
-    """
-    Anti-aliased pill-shaped progress bar, 4× supersampled.
-    Returns BAR_W × BAR_H image.
-    """
+    """Anti-aliased pill-shaped progress bar, 4× supersampled."""
     sw, sh = BAR_W * SCALE, BAR_H * SCALE
     r      = sh // 2
     img    = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
     draw   = ImageDraw.Draw(img)
 
-    track_rgba = _hex_to_rgb(COLORS["track"]) + (255,)
-    draw.rounded_rectangle([0, 0, sw-1, sh-1], radius=r, fill=track_rgba)
-
+    draw.rounded_rectangle([0, 0, sw-1, sh-1], radius=r,
+                            fill=_hex_to_rgb(COLORS["track"]) + (255,))
     if util > 0:
-        fill_w = max(sh, int(sw * util))   # min width = height keeps ends round
-        fill_rgba = _hex_to_rgb(color_hex) + (255,)
-        draw.rounded_rectangle([0, 0, fill_w-1, sh-1], radius=r, fill=fill_rgba)
+        fill_w = max(sh, int(sw * util))
+        draw.rounded_rectangle([0, 0, fill_w-1, sh-1], radius=r,
+                                fill=_hex_to_rgb(color_hex) + (255,))
 
     return img.resize((BAR_W, BAR_H), Image.LANCZOS)
 
 
 def _make_dot(color_hex: str, size: int = 10) -> Image.Image:
-    """Small anti-aliased circle for legend."""
     s    = size * SCALE
     img  = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -222,21 +256,19 @@ def make_icon(five_hour: Optional[float] = None,
               seven_day: Optional[float] = None) -> Image.Image:
     """64×64 tray icon. Outer arc = weekly, inner dot = 5h. 4× supersampled."""
     size = 64
-    s    = size * SCALE   # 256
+    s    = size * SCALE
     img  = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     if seven_day is None and five_hour is None:
-        draw.ellipse([8*SCALE, 8*SCALE, (size-8)*SCALE, (size-8)*SCALE],
-                     fill=(80, 80, 90, 255))
         return img.resize((size, size), Image.LANCZOS)
 
-    sd  = seven_day  if seven_day  is not None else 0.0
-    fh  = five_hour  if five_hour  is not None else 0.0
+    sd = seven_day if seven_day is not None else 0.0
+    fh = five_hour if five_hour is not None else 0.0
 
     pad, rw  = 3*SCALE, 10*SCALE
-    bg_color = _hex_to_rgb(COLORS["bg"]) + (255,)
-    track    = _hex_to_rgb(COLORS["track"]) + (255,)
+    bg_color = (28, 28, 46, 255)   # deep navy disc — readable on any taskbar
+    track    = (58, 58, 72, 255)
 
     draw.ellipse([pad, pad, s-pad, s-pad], fill=bg_color)
     draw.arc([pad+SCALE, pad+SCALE, s-pad-SCALE, s-pad-SCALE],
@@ -246,28 +278,28 @@ def make_icon(five_hour: Optional[float] = None,
                  start=-90, end=-90 + int(360*sd),
                  fill=usage_rgb(sd) + (255,), width=rw)
 
-    inner = pad + rw + 4*SCALE
+    inner     = pad + rw + 4*SCALE
     dot_color = usage_rgb(fh) + (255,) if fh > 0 else track
     draw.ellipse([inner, inner, s-inner, s-inner], fill=dot_color)
 
     return img.resize((size, size), Image.LANCZOS)
 
-# ── Detail popup ──────────────────────────────────────────────────────────────
+# ── Detail popup sections ─────────────────────────────────────────────────────
 
 def _double_ring_section(parent, sd_util, sd_resets, fh_util, fh_resets):
     frame = tk.Frame(parent, bg=COLORS["bg"])
-    frame.pack(pady=(2, 4))
+    frame.pack(pady=(4, 4))
 
-    # Rings (PIL-rendered, displayed on Canvas)
+    # Rings rendered by PIL, displayed on a Canvas
     ring_img = _render_ring_image(sd_util, fh_util)
     cv = tk.Canvas(frame, width=RING_SIZE, height=RING_SIZE,
                    bg=COLORS["bg"], highlightthickness=0)
     cv.pack()
-    cv._photo = ImageTk.PhotoImage(ring_img)   # prevent GC
+    cv._photo = ImageTk.PhotoImage(ring_img)
     cv.create_image(0, 0, image=cv._photo, anchor="nw")
 
-    # Centre text (ClearType via tkinter, layered over PIL rings)
-    cx = RING_SIZE // 2
+    # Centre text — ClearType via tkinter, layered over PIL rings
+    cx       = RING_SIZE // 2
     sd_color = usage_hex(sd_util)
     cv.create_text(cx, cx - 14,
                    text=f"{int(sd_util*100)}%",
@@ -278,71 +310,72 @@ def _double_ring_section(parent, sd_util, sd_resets, fh_util, fh_resets):
 
     # Legend row
     legend = tk.Frame(frame, bg=COLORS["bg"])
-    legend.pack(pady=(6, 0))
+    legend.pack(pady=(8, 2))
 
     for color, label in [
-        (sd_color,         f"7d: {int(sd_util*100)}%"),
-        (usage_hex(fh_util), f"5h: {int(fh_util*100)}%"),
+        (sd_color,           f"7d  {int(sd_util*100)}%"),
+        (usage_hex(fh_util), f"5h  {int(fh_util*100)}%"),
     ]:
         lf = tk.Frame(legend, bg=COLORS["bg"])
-        lf.pack(side="left", padx=10)
-
+        lf.pack(side="left", padx=14)
         dot_img = _make_dot(color, 8)
         dot_lbl = tk.Label(lf, bg=COLORS["bg"])
         dot_lbl._photo = ImageTk.PhotoImage(dot_img)
         dot_lbl.configure(image=dot_lbl._photo)
-        dot_lbl.pack(side="left", padx=(0, 4))
-
+        dot_lbl.pack(side="left", padx=(0, 5))
         tk.Label(lf, text=label, font=("Segoe UI", 8),
                  bg=COLORS["bg"], fg=COLORS["muted"]).pack(side="left")
 
-    # Reset times
+    # Reset countdowns
     for rt in filter(None, [fmt_reset(sd_resets), fmt_reset(fh_resets)]):
         tk.Label(frame, text=rt, font=("Segoe UI", 8),
                  bg=COLORS["bg"], fg=COLORS["muted"]).pack()
 
 
 def _bar_row(parent, label: str, util: float, resets_at: Optional[str]):
-    """iOS-style metric card with pill progress bar."""
-    card = tk.Frame(parent, bg=COLORS["bg2"], padx=14, pady=10)
-    card.pack(fill="x", pady=(0, 8))
+    """Glass-style metric card with a pill progress bar."""
+    # Outer frame = 1-px separator-colored border
+    outer = tk.Frame(parent, bg=COLORS["separator"])
+    outer.pack(fill="x", pady=(0, 8))
+    card = tk.Frame(outer, bg=COLORS["bg2"], padx=14, pady=10)
+    card.pack(fill="both", expand=True, padx=1, pady=1)
 
     color = usage_hex(util)
     pct   = int(util * 100)
 
     row = tk.Frame(card, bg=COLORS["bg2"])
-    row.pack(fill="x", pady=(0, 6))
+    row.pack(fill="x", pady=(0, 7))
     tk.Label(row, text=label, font=("Segoe UI", 10),
              bg=COLORS["bg2"], fg=COLORS["text"]).pack(side="left")
     tk.Label(row, text=f"{pct}%", font=("Segoe UI", 10, "bold"),
              bg=COLORS["bg2"], fg=color).pack(side="right")
 
-    bar_img = _render_pill_bar(util, color)
-    bar_cv  = tk.Canvas(card, width=BAR_W, height=BAR_H,
-                        bg=COLORS["bg2"], highlightthickness=0)
+    bar_cv = tk.Canvas(card, width=BAR_W, height=BAR_H,
+                       bg=COLORS["bg2"], highlightthickness=0)
     bar_cv.pack()
-    bar_cv._photo = ImageTk.PhotoImage(bar_img)
+    bar_cv._photo = ImageTk.PhotoImage(_render_pill_bar(util, color))
     bar_cv.create_image(0, 0, image=bar_cv._photo, anchor="nw")
 
     rt = fmt_reset(resets_at)
     if rt:
         tk.Label(card, text=rt, font=("Segoe UI", 8),
-                 bg=COLORS["bg2"], fg=COLORS["muted"]).pack(anchor="w", pady=(4, 0))
+                 bg=COLORS["bg2"], fg=COLORS["muted"]).pack(anchor="w", pady=(5, 0))
 
+# ── Detail popup ──────────────────────────────────────────────────────────────
 
 EXTRA_BAR_KEYS = [
     ("seven_day_sonnet", "7-Day Sonnet"),
     ("seven_day_opus",   "7-Day Opus"),
 ]
 
-HEADER_H    = 52
-RING_H      = 248   # ring(180) + legend(38) + resets(30)
-BAR_ROW_H   = 72
-SEP_H       = 17
-FOOTER_H    = 26
-ERR_H       = 55
-EMPTY_H     = 35
-CARD_PAD    = 18    # content frame inset from card edge
+HEADER_H  = 64   # header label + separator + padding
+RING_H    = 252  # ring canvas + legend + reset labels
+BAR_ROW_H = 78   # card height per bar row
+SEP_H     = 20   # separator between rings and bars
+FOOTER_H  = 32   # updated timestamp
+ERR_H     = 58   # error message
+EMPTY_H   = 40   # loading placeholder
+CARD_PAD  = 16   # content inset from window edge
 
 
 def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
@@ -363,66 +396,79 @@ def open_detail(root: tk.Tk, usage_data, last_error, last_updated):
     has_rings = sd_data or fh_data
     content_h = (
         HEADER_H
-        + (RING_H if has_rings else 0)
-        + (SEP_H  if has_rings and bar_rows else 0)
+        + (RING_H   if has_rings else 0)
+        + (SEP_H    if has_rings and bar_rows else 0)
         + len(bar_rows) * BAR_ROW_H
-        + (ERR_H   if last_error else 0)
-        + (EMPTY_H if not has_rings and not bar_rows and not last_error else 0)
+        + (ERR_H    if last_error else 0)
+        + (EMPTY_H  if not has_rings and not bar_rows and not last_error else 0)
         + FOOTER_H
     )
 
     win = tk.Toplevel(root)
     win.overrideredirect(True)
-    win.configure(bg=COLORS["bg"])
+    win.configure(bg=COLORS["glass_edge"])   # window bg shows as 1-px glass border
     win.attributes("-topmost", True)
 
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
     win.geometry(f"{POPUP_W}x{content_h}+{sw-POPUP_W-14}+{sh-content_h-52}")
 
-    # Apply Windows 11 native rounded corners + drop shadow
     win.update_idletasks()
     _apply_dwm_style(win.winfo_id())
+    _fade_in(win, target=GLASS_ALPHA)   # smooth appearance animation
 
-    # Content frame directly in window (no canvas background needed)
+    # Content frame sits 1px inside → glass_edge color shows as border
     content = tk.Frame(win, bg=COLORS["bg"])
-    content.pack(fill="both", expand=True, padx=CARD_PAD, pady=CARD_PAD)
+    content.pack(fill="both", expand=True, padx=1, pady=1)
+
+    inner = tk.Frame(content, bg=COLORS["bg"])
+    inner.pack(fill="both", expand=True, padx=CARD_PAD, pady=CARD_PAD)
 
     # ── Header ────────────────────────────────────────────────────────────────
-    hdr = tk.Frame(content, bg=COLORS["bg"])
+    hdr = tk.Frame(inner, bg=COLORS["bg"])
     hdr.pack(fill="x", pady=(0, 8))
-    tk.Label(hdr, text="Claude AI Usage", font=("Segoe UI", 13, "bold"),
+
+    tk.Label(hdr, text="Claude AI Usage",
+             font=("Segoe UI", 13, "bold"),
              bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left")
-    close = tk.Label(hdr, text="✕", font=("Segoe UI", 11),
-                     bg=COLORS["bg"], fg=COLORS["muted"], cursor="hand2")
+
+    close = tk.Label(hdr, text="✕",
+                     font=("Segoe UI", 11),
+                     bg=COLORS["bg"], fg=COLORS["muted"],
+                     cursor="hand2", padx=4)
     close.pack(side="right")
     close.bind("<Button-1>", lambda _: win.destroy())
+    close.bind("<Enter>",    lambda _: close.configure(fg=COLORS["red"]))
+    close.bind("<Leave>",    lambda _: close.configure(fg=COLORS["muted"]))
+
+    # Thin separator under header
+    tk.Frame(inner, bg=COLORS["separator"], height=1).pack(fill="x", pady=(0, 8))
 
     # ── Body ──────────────────────────────────────────────────────────────────
     if last_error:
-        tk.Label(content, text=f"⚠  {last_error}",
+        tk.Label(inner, text=f"⚠  {last_error}",
                  font=("Segoe UI", 8), bg=COLORS["bg"], fg=COLORS["red"],
                  wraplength=POPUP_W - CARD_PAD*2 - 10,
                  justify="left").pack(anchor="w", pady=(0, 8))
     elif not has_rings and not bar_rows:
-        tk.Label(content, text="Loading usage data…",
+        tk.Label(inner, text="Loading usage data…",
                  font=("Segoe UI", 10), bg=COLORS["bg"],
                  fg=COLORS["muted"]).pack(anchor="w", pady=8)
     else:
         sd_u, sd_r = sd_data if sd_data else (0.0, None)
         fh_u, fh_r = fh_data if fh_data else (0.0, None)
-        _double_ring_section(content, sd_u, sd_r, fh_u, fh_r)
+        _double_ring_section(inner, sd_u, sd_r, fh_u, fh_r)
 
         if bar_rows:
-            tk.Frame(content, bg=COLORS["separator"], height=1).pack(
-                fill="x", pady=(4, 10))
+            tk.Frame(inner, bg=COLORS["separator"], height=1).pack(
+                fill="x", pady=(4, 12))
             for lbl, util, ra in bar_rows:
-                _bar_row(content, lbl, util, ra)
+                _bar_row(inner, lbl, util, ra)
 
     # ── Footer ────────────────────────────────────────────────────────────────
     if last_updated:
-        tk.Label(content, text=f"Updated {last_updated.strftime('%H:%M')}",
+        tk.Label(inner, text=f"Updated {last_updated.strftime('%H:%M')}",
                  font=("Segoe UI", 8), bg=COLORS["bg"],
-                 fg=COLORS["muted"]).pack(anchor="e", pady=(4, 8))
+                 fg=COLORS["muted"]).pack(anchor="e", pady=(4, 0))
 
     # Focus + close-on-blur
     def _on_focus_out(event):
@@ -502,9 +548,12 @@ class App:
             self.root.after(150, self._drain_queue)
 
     def on_view(self, *_):
-        with self._lock:
-            d, e, u = self.usage_data, self.last_error, self.last_updated
-        self._enqueue(lambda: open_detail(self.root, d, e, u))
+        def _refresh_then_show():
+            self._refresh()
+            with self._lock:
+                d, e, u = self.usage_data, self.last_error, self.last_updated
+            self._enqueue(lambda: open_detail(self.root, d, e, u))
+        threading.Thread(target=_refresh_then_show, daemon=True).start()
 
     def on_refresh(self, *_):
         threading.Thread(target=self._refresh, daemon=True).start()

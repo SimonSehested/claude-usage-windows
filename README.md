@@ -4,8 +4,6 @@ A Windows system tray app that shows your **claude.ai subscription usage** as a 
 
 Inspired by the macOS apps shared on Reddit and [ClaudeUsageBar](https://www.claudeusagebar.com/).
 
-![System tray icon showing usage ring]
-
 ---
 
 ## What it shows
@@ -17,39 +15,27 @@ Inspired by the macOS apps shared on Reddit and [ClaudeUsageBar](https://www.cla
 | **7-Day Sonnet** | Sonnet-specific weekly usage (Pro/Max plans) |
 | **7-Day Opus** | Opus-specific weekly usage (if applicable) |
 
-Colors: 🟢 green < 60% · 🟡 yellow < 85% · 🔴 red ≥ 85%
+Colors: 🟢 green < 60% · 🟠 amber < 85% · 🔴 red ≥ 85%
+
+The tray icon is **invisible until data has loaded** – it appears automatically once the first fetch completes.
+
+---
+
+## Requirements
+
+- **Claude Code** installed and logged in (`claude` CLI)
+- **Python 3.8+** (Miniforge/Anaconda/python.org)
+
+No session key or manual setup required. The app reads credentials directly from Claude Code's login (`~/.claude/.credentials.json`).
 
 ---
 
 ## Installation
 
-**Requirements:** Python 3.8+ – download from [python.org](https://www.python.org/downloads/) (check *Add Python to PATH*)
-
 ```
 1. Double-click  install.bat   ← installs Python dependencies
 2. Double-click  run.bat       ← starts the app in the system tray
 ```
-
-On first launch, a settings window opens automatically to enter your session key.
-
----
-
-## Getting your session key
-
-Your session key is a cookie from claude.ai that the app uses to fetch your usage data. It never leaves your computer.
-
-**Step by step:**
-1. Open [claude.ai](https://claude.ai) and make sure you're logged in
-2. Press **F12** to open DevTools
-3. Go to the **Network** tab, then press **F5** to reload
-4. Find a request called **`usage`** and click it
-5. In **Request Headers**, find the `Cookie:` header
-6. Copy the value that starts with `sessionKey=sk-ant-sid01-…`
-7. Paste it into the Settings window (the app strips the `sessionKey=` prefix automatically)
-
-**Alternative (easier):**
-1. Press F12 → **Application** tab → **Cookies** → `https://claude.ai`
-2. Find the `sessionKey` row and copy the Value column
 
 ---
 
@@ -57,13 +43,12 @@ Your session key is a cookie from claude.ai that the app uses to fetch your usag
 
 | Action | Result |
 |---|---|
-| **Left-click** or double-click icon | Opens usage popup with progress bars |
+| **Left-click** icon | Fetches fresh data and opens usage popup |
 | **Right-click** | Tray menu |
-| Menu → **Refresh Now** | Forces an immediate update |
-| Menu → **Settings…** | Update your session key |
+| Menu → **Refresh Now** | Forces an immediate background update |
 | Menu → **Open Claude.ai** | Opens claude.ai in browser |
 
-The app auto-refreshes every **5 minutes**.
+The app also auto-refreshes every **5 minutes** in the background.
 
 ---
 
@@ -77,21 +62,23 @@ Double-click  add_to_startup.bat
 
 To remove: delete `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\ClaudeUsageMonitor.bat`
 
+Alternatively, right-click the tray icon → **Start with Windows**.
+
 ---
 
 ## Privacy & Security
 
-- Your session key is stored in **Windows Credential Manager** (encrypted), not in a plain text file
-- All requests go directly from your computer to `claude.ai` – no third-party servers
+- Credentials are read from Claude Code's local login file – nothing is stored separately
+- All requests go directly from your computer to `api.anthropic.com` – no third-party servers
 - No telemetry, no analytics, no data collection
 
 ---
 
 ## Notes
 
-- This uses an **unofficial, undocumented** internal claude.ai API endpoint. It may break if Anthropic changes their API
-- The session key expires periodically – if you see an error, get a fresh key from your browser
-- Works on Free, Pro, and Max plans (available metrics vary by plan)
+- Requires an active Claude Code login. If the token expires, run `claude` in a terminal and log in again
+- Works on Pro and Max plans (available metrics vary by plan)
+- Uses the same OAuth token as Claude Code – if Claude Code works, this works
 
 ---
 
@@ -99,7 +86,7 @@ To remove: delete `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Claud
 
 | Problem | Fix |
 |---|---|
-| "No session key set" | Right-click tray → Settings → enter your key |
-| "Session key is invalid or expired" | Get a fresh key from your browser (see above) |
+| Icon never appears | Make sure you're logged in: run `claude` in a terminal |
+| "Token expired" error | Run `claude` in a terminal to refresh the login |
 | App doesn't appear in tray | Run `run.bat` again; check Task Manager for `pythonw.exe` |
 | `ModuleNotFoundError` | Run `install.bat` first |
