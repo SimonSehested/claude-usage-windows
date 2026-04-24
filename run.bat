@@ -1,3 +1,3 @@
 @echo off
-cd /d "%~dp0"
-start "" pythonw.exe claude_usage.py
+cd /d "C:\Users\sehes\GitHub\claude-usage-tray"
+start "" "node_modules\electron\dist\electron.exe" .
