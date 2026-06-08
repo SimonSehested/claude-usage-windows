@@ -56,20 +56,20 @@ Follows Apple's iOS system colors, adapted for light and dark mode:
 
 ### Popup layout (top to bottom)
 
-1. **Header** — "Claude AI Usage" (bold, 13px) + ✕ close button
-2. **Separator** (1px)
-3. **Double ring** (SVG, 160px diameter)
+No header or close button. The popup closes only via blur (click outside) or Escape key.
+
+1. **Double ring** (SVG, 160px diameter)
    - Outer arc: 7-day utilisation, coloured by threshold
    - Inner arc: 5-hour utilisation, coloured by threshold
    - Centre text: 7-day percentage (large) + "7-DAY" label (small, muted)
-4. **Legend row** — two dot + label pairs: "7-day 67%" and "5-hour 32%"
-5. **Reset times** — "7-day nulstilles om **3d 14t**" / "5-hour nulstilles om **3t 22m**" (small, centred)
-6. **Separator** (1px, only if bar rows follow)
-7. **Bar rows** (one card per metric, only rendered if API returns the field)
+2. **Legend row** — two dot + label pairs: "7-day 67%" and "5-hour 32%"
+3. **Reset times** — "7-day nulstilles om **3d 14t**" / "5-hour nulstilles om **3t 22m**" (small, centred)
+4. **Separator** (1px, only if bar rows follow)
+5. **Bar rows** (one card per metric, only rendered if API returns the field)
    - 7-Day Sonnet
    - 7-Day Opus
    - Each card: label + percentage on top row, pill progress bar below
-8. **Footer** — "Opdateret HH:MM" (right-aligned, muted, 8px)
+6. **Footer** — "Opdateret HH:MM" (right-aligned, muted, 8px)
 
 ### Tray icon
 
