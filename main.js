@@ -4,7 +4,7 @@ const {
 } = require('electron');
 const path = require('path');
 const { fetchUsage, normalise } = require('./src/api');
-const { makeTrayIcon } = require('./src/icon');
+const { makeIconPng } = require('./src/icon');
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const WIN_WIDTH = 280;
@@ -26,10 +26,7 @@ function buildIcon(data) {
     if (data.seven_day?.utilization != null) sd = normalise(data.seven_day.utilization);
     if (data.five_hour?.utilization != null) fh = normalise(data.five_hour.utilization);
   }
-  const svg = makeTrayIcon(sd, fh);
-  return nativeImage.createFromDataURL(
-    'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)
-  );
+  return nativeImage.createFromBuffer(makeIconPng(sd, fh));
 }
 
 function buildTooltip(data) {
