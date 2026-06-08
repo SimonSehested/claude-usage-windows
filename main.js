@@ -1,6 +1,6 @@
 const {
   app, Tray, BrowserWindow, nativeImage, nativeTheme,
-  ipcMain, screen, Menu, shell,
+  ipcMain, screen, Menu,
 } = require('electron');
 const path = require('path');
 const { fetchUsage, normalise } = require('./src/api');
